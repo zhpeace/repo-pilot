@@ -157,6 +157,8 @@ const messages: Record<Lang, Record<string, string>> = {
     logExportFail: "导出失败：{e}",
     logImportOk: "配置已导入",
     logImportFail: "导入失败：{e}",
+    logImportSkipDirs: "已跳过不存在的目录（{n} 个）：{d}",
+    logImportNoDirs: "导入的根目录均不存在，请手动添加目录",
     copyUrl: "复制 URL",
     logCopied: "已复制：{u}",
     logCopyFail: "复制失败，请手动复制",
@@ -363,6 +365,8 @@ const messages: Record<Lang, Record<string, string>> = {
     logExportFail: "Export failed: {e}",
     logImportOk: "Config imported",
     logImportFail: "Import failed: {e}",
+    logImportSkipDirs: "Skipped missing directories ({n}): {d}",
+    logImportNoDirs: "None of the imported roots exist; please add directories manually",
     copyUrl: "Copy URL",
     logCopied: "Copied: {u}",
     logCopyFail: "Copy failed, please copy manually",
@@ -1023,9 +1027,15 @@ async function importConfig() {
       groupNames?: string[];
       favs?: string[];
     };
-    if (Array.isArray(cfg.roots)) {
-      roots.value = cfg.roots;
-      await invoke("save_roots", { roots: cfg.roots }).catch(() => {});
+    if (Array.isArray(cfg.roots) && cfg.roots.length) {
+      const exists = await invoke<boolean[]>("check_dirs", { paths: cfg.roots });
+      const valid = cfg.roots.filter((_, i) => exists[i]);
+      const invalid = cfg.roots.filter((_, i) => !exists[i]);
+      if (invalid.length)
+        addLog(tr("logImportSkipDirs", { n: invalid.length, d: invalid.join(", ") }));
+      if (!valid.length) addLog(t("logImportNoDirs"));
+      roots.value = valid;
+      await invoke("save_roots", { roots: valid }).catch(() => {});
     }
     if (Array.isArray(cfg.groupNames)) groupNames.value = cfg.groupNames;
     if (cfg.groups && typeof cfg.groups === "object") groups.value = cfg.groups;

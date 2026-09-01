@@ -878,6 +878,12 @@ fn import_config(path: String) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| e.to_string())
 }
 
+/// 批量检查目录是否存在（用于导入配置时过滤无效根目录）
+#[tauri::command]
+fn check_dirs(paths: Vec<String>) -> Vec<bool> {
+    paths.iter().map(|p| PathBuf::from(p).is_dir()).collect()
+}
+
 fn app_config_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -1055,7 +1061,8 @@ pub fn run() {
             stash_pop_repos,
             get_log,
             export_config,
-            import_config
+            import_config,
+            check_dirs
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
