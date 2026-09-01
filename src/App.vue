@@ -26,6 +26,10 @@ interface Row {
   hasChildren: boolean;
   expanded: boolean;
   seq: string;
+  /** 未命中/未收藏、仅随父仓库展开显示的次要行 */
+  follow?: boolean;
+  /** 因命中子仓库而带出的父容器行（默认展开） */
+  container?: boolean;
 }
 interface OpResult {
   path: string;
@@ -139,7 +143,9 @@ const messages: Record<Lang, Record<string, string>> = {
     deselect: "取消选择",
     selectVisible: "全选当前({n})",
     selected: "已选 {a} / {b}",
-    showOfTotal: "当前显示 {a} / {b}",
+    showOfTotal: "匹配 {a} / {b}",
+    followHint: "随父显示（未收藏 / 未命中）",
+    containerHint: "父仓库（含匹配的子仓库）",
     copyUrl: "复制 URL",
     logCopied: "已复制：{u}",
     logCopyFail: "复制失败，请手动复制",
@@ -170,6 +176,10 @@ const messages: Record<Lang, Record<string, string>> = {
     ungrouped: "未分组",
     newGroup: "+ 新建分组",
     deleteGroup: "删除该组",
+    renameGroup: "重命名",
+    groupRenamePlaceholder: "输入新分组名",
+    logGroupRenamed: "已重命名分组：{a} → {b}",
+    logGroupRenameConflict: "分组名冲突：{g} 已存在",
     confirmDelete: "确认删除？",
     groupPlaceholder: "分组名称（支持 父级/子级，如 工作/前端）",
     ok: "确定",
@@ -329,7 +339,9 @@ const messages: Record<Lang, Record<string, string>> = {
     deselect: "Deselect",
     selectVisible: "Select visible ({n})",
     selected: "{a} / {b} selected",
-    showOfTotal: "Showing {a} of {b}",
+    showOfTotal: "Matched {a} of {b}",
+    followHint: "Shown with parent (not favorited / not matched)",
+    containerHint: "Parent repo (contains matched children)",
     copyUrl: "Copy URL",
     logCopied: "Copied: {u}",
     logCopyFail: "Copy failed, please copy manually",
@@ -360,6 +372,10 @@ const messages: Record<Lang, Record<string, string>> = {
     ungrouped: "Ungrouped",
     newGroup: "+ New group",
     deleteGroup: "Delete group",
+    renameGroup: "Rename",
+    groupRenamePlaceholder: "Enter new group name",
+    logGroupRenamed: "Renamed group: {a} → {b}",
+    logGroupRenameConflict: "Group name conflict: {g} already exists",
     confirmDelete: "Confirm?",
     groupPlaceholder: "Group name (supports parent/child, e.g. work/frontend)",
     ok: "OK",
@@ -719,6 +735,44 @@ function removeGroup(name: string) {
   persistGroups();
   addLog(tr("logGroupDeleted", { g: name }));
 }
+const showRename = ref(false);
+const renameGroupName = ref("");
+const renameGrpInput = ref<HTMLInputElement | null>(null);
+function openRename() {
+  renameGroupName.value = activeGroup.value;
+  showRename.value = true;
+  nextTick(() => renameGrpInput.value?.focus());
+}
+function confirmRename() {
+  const newName = renameGroupName.value.trim();
+  const oldName = activeGroup.value;
+  showRename.value = false;
+  if (!newName || newName === oldName) return;
+  // 不能与其它分组（或其子分组）重名
+  if (
+    groupNames.value.some(
+      (n) => n !== oldName && (n === newName || n.startsWith(newName + "/"))
+    )
+  ) {
+    addLog(tr("logGroupRenameConflict", { g: newName }));
+    return;
+  }
+  // 更新分组名列表：自身 + 子分组前缀
+  groupNames.value = groupNames.value.map((n) =>
+    n === oldName ? newName : n.startsWith(oldName + "/") ? newName + n.slice(oldName.length) : n
+  );
+  // 更新仓库的分组赋值：同样替换前缀
+  const g: Record<string, string> = {};
+  for (const k in groups.value) {
+    const v = groups.value[k];
+    g[k] =
+      v === oldName ? newName : v.startsWith(oldName + "/") ? newName + v.slice(oldName.length) : v;
+  }
+  groups.value = g;
+  activeGroup.value = newName;
+  persistGroups();
+  addLog(tr("logGroupRenamed", { a: oldName, b: newName }));
+}
 const statusFilter = ref("");
 const commitFilter = ref("all");
 const baseFiltered = computed(() => {
@@ -794,46 +848,79 @@ const emptyHint = computed(() => {
 });
 
 // ===== 嵌套仓库树 =====
-// 把过滤后的仓库按父子关系展开为树形行序列：父仓库可展开/折叠，子仓库缩进显示
+// 把过滤后的仓库按父子关系展开为树形行序列：父仓库可展开/折叠，子仓库缩进显示。
+// 过滤/收藏/搜索视图下：
+//  - 父仓库被命中/收藏 → 带上其全部子仓库（未命中/未收藏的标记为 follow 次要行）
+//  - 子仓库被命中/收藏 → 带出其父仓库作为容器行（默认展开，便于看到命中的子）
 const visibleRows = computed<Row[]>(() => {
-  const rows: Row[] = [];
   const list = filteredRepos.value;
   const inList = new Set(list.map((x) => x.path));
-  const childrenMap = new Map<string, RepoStatus[]>();
-  for (const r of list) {
-    if (r.parent && inList.has(r.parent)) {
-      if (!childrenMap.has(r.parent)) childrenMap.set(r.parent, []);
-      childrenMap.get(r.parent)!.push(r);
+  // 全量子节点映射（基于全量 repos，保证过滤/收藏/搜索视图也能带出子仓库）
+  const allChildren = new Map<string, RepoStatus[]>();
+  for (const r of repos.value) {
+    if (r.parent) {
+      const arr = allChildren.get(r.parent);
+      if (arr) arr.push(r);
+      else allChildren.set(r.parent, [r]);
     }
   }
+  // 容器父仓库：子仓库被命中/收藏、父仓库不在结果中 → 父作为容器行带出（默认展开）
+  const containerSet = new Set<string>();
+  for (const r of list) {
+    if (r.parent && !inList.has(r.parent)) containerSet.add(r.parent);
+  }
+  const rows: Row[] = [];
   const emitted = new Set<string>();
+
   const emitChildren = (parentPath: string, depth: number, prefix: string) => {
-    const kids = childrenMap.get(parentPath) ?? [];
+    const kids = allChildren.get(parentPath) ?? [];
     let idx = 0;
     for (const k of kids) {
       if (emitted.has(k.path)) continue;
       emitted.add(k.path);
-      const hasCh = !!childrenMap.get(k.path)?.length;
-      const isExp = expanded.value.has(k.path);
+      const isContainer = containerSet.has(k.path);
+      const hasCh = !!allChildren.get(k.path)?.length;
+      // 容器行始终展开（否则命中的孙仓库不可见）
+      const isExp = expanded.value.has(k.path) || isContainer;
       idx += 1;
       const seq = `${prefix}.${idx}`;
-      rows.push({ r: k, depth, hasChildren: hasCh, expanded: isExp, seq });
+      rows.push({
+        r: k,
+        depth,
+        hasChildren: hasCh,
+        expanded: isExp,
+        seq,
+        follow: !inList.has(k.path) && !isContainer,
+        container: isContainer,
+      });
       if (hasCh && isExp) emitChildren(k.path, depth + 1, seq);
     }
   };
+
   let top = 0;
   for (const r of list) {
     if (emitted.has(r.path)) continue;
-    // 子仓库由父仓库展开统一输出，不单独作为顶层行（父被过滤掉时则作为孤儿顶层显示）
-    if (r.parent && inList.has(r.parent)) continue;
-    // 顶层：无 parent 或 parent 已被过滤掉
-    const hasCh = !!childrenMap.get(r.path)?.length;
+    // 子仓库由父/容器展开统一输出，不单独作为顶层行
+    if (r.parent && (inList.has(r.parent) || containerSet.has(r.parent))) continue;
+    emitted.add(r.path);
+    const hasCh = !!allChildren.get(r.path)?.length;
     const isExp = expanded.value.has(r.path);
     top += 1;
     const seq = String(top);
     rows.push({ r, depth: 0, hasChildren: hasCh, expanded: isExp, seq });
-    emitted.add(r.path);
     if (hasCh && isExp) emitChildren(r.path, 1, seq);
+  }
+  // 容器行：父仓库不在结果中、但有子仓库被命中/收藏 → 顶层容器，默认展开带出命中子
+  for (const c of containerSet) {
+    if (emitted.has(c)) continue;
+    const cr = repos.value.find((x) => x.path === c);
+    if (!cr) continue;
+    emitted.add(c);
+    const hasCh = !!allChildren.get(c)?.length;
+    top += 1;
+    const seq = String(top);
+    rows.push({ r: cr, depth: 0, hasChildren: hasCh, expanded: true, seq, container: true });
+    if (hasCh) emitChildren(c, 1, seq);
   }
   return rows;
 });
@@ -1583,6 +1670,24 @@ async function replaceRemote() {
           >
             {{ pendingDelete === activeGroup ? t("confirmDelete") : t("deleteGroup") }}
           </button>
+          <button
+            v-if="activeGroup && groupNodes.some((n) => n.path === activeGroup)"
+            class="ghost"
+            @click="openRename"
+          >
+            {{ t("renameGroup") }}
+          </button>
+          <div class="new-grp-row" v-if="showRename">
+            <input
+              v-model="renameGroupName"
+              ref="renameGrpInput"
+              :placeholder="t('groupRenamePlaceholder')"
+              @keyup.enter="confirmRename"
+              @keyup.esc="showRename = false"
+            />
+            <button @click="confirmRename">{{ t("ok") }}</button>
+            <button class="ghost" @click="showRename = false">{{ t("cancel") }}</button>
+          </div>
           <div class="new-grp-row" v-if="showNewGroup">
             <input
               v-model="newGroupName"
@@ -1674,7 +1779,7 @@ async function replaceRemote() {
             <tr
               v-for="row in visibleRows"
               :key="row.r.path"
-              :class="{ off: !selected.has(row.r.path) }"
+              :class="{ off: !selected.has(row.r.path), follow: !!row.follow }"
               @contextmenu="openCtx($event, row.r)"
             >
               <td class="idx">{{ row.seq }}</td>
@@ -1694,7 +1799,7 @@ async function replaceRemote() {
                     @click.stop="toggleExpand(row.r.path)"
                   >{{ row.expanded ? "▾" : "▸" }}</button>
                   <span v-else class="twist ph"></span>
-                  <span class="tree-name">{{ row.r.path.split("/").pop() }}</span>
+                  <span class="tree-name" :title="row.follow ? t('followHint') : row.container ? t('containerHint') : ''">{{ row.r.path.split("/").pop() }}</span>
                   <button
                     class="fav"
                     :title="favs.has(row.r.path) ? t('favRemove') : t('favAdd')"
@@ -2124,6 +2229,7 @@ th.sortable { cursor: pointer; user-select: none; }
 th.sortable:hover { color: #0969da; }
 .idx { width: 36px; text-align: center; color: #8c959f; }
 tr.off td { opacity: 0.85; }
+tr.follow td { opacity: 0.55; }
 td.name { font-weight: 600; }
 .tree-cell { display: inline-flex; align-items: center; gap: 2px; }
 .twist { width: 24px; height: 32px; padding: 0; border: none; background: none; cursor: pointer; color: #57606a; font-size: 20px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
