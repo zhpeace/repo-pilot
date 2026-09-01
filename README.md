@@ -2,6 +2,10 @@
 
 一个面向开发者、本地优先的多 Git 仓库批量管理桌面工具（Tauri 2 + Vue 3 + TypeScript）。适合同时维护几十个仓库、被 pull/push 烦到的人。
 
+## 界面
+
+![RepoPilot 界面](docs/screenshot.png)
+
 ## 功能
 
 ### 仓库总览
