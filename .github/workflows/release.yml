@@ -6,28 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  create-release:
-    runs-on: ubuntu-latest
-    outputs:
-      release_id: ${{ steps.create-release.outputs.id }}
-      upload_url: ${{ steps.create-release.outputs.upload_url }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Create release
-        id: create-release
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "RepoPilot ${{ github.ref_name }}"
-          releaseBody: "自动发布：请查看 Release 资产下载对应平台的安装包。"
-          draft: true
-          prerelease: false
-
   build:
-    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -48,6 +27,9 @@ jobs:
           node-version: 20
           cache: npm
 
+      - name: Install frontend dependencies
+        run: npm ci
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -64,5 +46,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         with:
           tagName: ${{ github.ref_name }}
-          releaseId: ${{ needs.create-release.outputs.release_id }}
-          uploadUrl: ${{ needs.create-release.outputs.upload_url }}
+          releaseName: "RepoPilot ${{ github.ref_name }}"
+          releaseBody: "自动发布：请查看 Release 资产下载对应平台的安装包。"
+          draft: false
+          prerelease: false
