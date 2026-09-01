@@ -7,6 +7,7 @@ import { listen } from "@tauri-apps/api/event";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { revealItemInDir, openUrl } from "@tauri-apps/plugin-opener";
+import { save, open } from "@tauri-apps/plugin-dialog";
 
 interface RepoStatus {
   path: string;
@@ -146,6 +147,16 @@ const messages: Record<Lang, Record<string, string>> = {
     showOfTotal: "匹配 {a} / {b}",
     followHint: "随父显示（未收藏 / 未命中）",
     containerHint: "父仓库（含匹配的子仓库）",
+    exportCfg: "导出",
+    exportCfgTip: "导出配置（根目录/分组/收藏）",
+    importCfg: "导入",
+    importCfgTip: "导入配置（覆盖当前）",
+    importConfirmShort: "确认导入？",
+    importConfirm: "再次点击「导入」确认，将覆盖当前根目录/分组/收藏",
+    logExportOk: "配置已导出：{p}",
+    logExportFail: "导出失败：{e}",
+    logImportOk: "配置已导入",
+    logImportFail: "导入失败：{e}",
     copyUrl: "复制 URL",
     logCopied: "已复制：{u}",
     logCopyFail: "复制失败，请手动复制",
@@ -342,6 +353,16 @@ const messages: Record<Lang, Record<string, string>> = {
     showOfTotal: "Matched {a} of {b}",
     followHint: "Shown with parent (not favorited / not matched)",
     containerHint: "Parent repo (contains matched children)",
+    exportCfg: "Export",
+    exportCfgTip: "Export config (roots/groups/favorites)",
+    importCfg: "Import",
+    importCfgTip: "Import config (overwrites current)",
+    importConfirmShort: "Confirm import?",
+    importConfirm: "Click Import again to confirm; it overwrites current roots/groups/favorites",
+    logExportOk: "Config exported: {p}",
+    logExportFail: "Export failed: {e}",
+    logImportOk: "Config imported",
+    logImportFail: "Import failed: {e}",
     copyUrl: "Copy URL",
     logCopied: "Copied: {u}",
     logCopyFail: "Copy failed, please copy manually",
@@ -955,6 +976,68 @@ async function copyUrl(url: string) {
     addLog(tr("logCopied", { u: url }));
   } catch {
     addLog(t("logCopyFail"));
+  }
+}
+
+// ===== 配置导出 / 导入 =====
+const pendingImport = ref(false);
+async function exportConfig() {
+  try {
+    const data = {
+      app: "repo-pilot",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      roots: roots.value,
+      groups: groups.value,
+      groupNames: groupNames.value,
+      favs: [...favs.value],
+    };
+    const path = await save({
+      defaultPath: `repopilot-config-${new Date().toISOString().slice(0, 10)}.json`,
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    if (!path) return;
+    await invoke("export_config", { path, data: JSON.stringify(data, null, 2) });
+    addLog(tr("logExportOk", { p: path }));
+  } catch (e) {
+    addLog(tr("logExportFail", { e: String(e) }));
+  }
+}
+async function importConfig() {
+  if (!pendingImport.value) {
+    pendingImport.value = true;
+    addLog(t("importConfirm"));
+    setTimeout(() => {
+      pendingImport.value = false;
+    }, 3000);
+    return;
+  }
+  pendingImport.value = false;
+  try {
+    const path = await open({ multiple: false, filters: [{ name: "JSON", extensions: ["json"] }] });
+    if (!path) return;
+    const raw = await invoke<string>("import_config", { path });
+    const cfg = JSON.parse(raw) as {
+      roots?: string[];
+      groups?: Record<string, string>;
+      groupNames?: string[];
+      favs?: string[];
+    };
+    if (Array.isArray(cfg.roots)) {
+      roots.value = cfg.roots;
+      await invoke("save_roots", { roots: cfg.roots }).catch(() => {});
+    }
+    if (Array.isArray(cfg.groupNames)) groupNames.value = cfg.groupNames;
+    if (cfg.groups && typeof cfg.groups === "object") groups.value = cfg.groups;
+    persistGroups();
+    if (Array.isArray(cfg.favs)) {
+      favs.value = new Set(cfg.favs);
+      await invoke("save_favs", { paths: cfg.favs }).catch(() => {});
+    }
+    addLog(t("logImportOk"));
+    if (roots.value.length) scan();
+  } catch (e) {
+    addLog(tr("logImportFail", { e: String(e) }));
   }
 }
 
@@ -1599,6 +1682,8 @@ async function replaceRemote() {
             </button>
             <button class="ghost" @click="showAbout = true" title="About">ⓘ</button>
             <button class="ghost" @click="checkUpdate(true)" :title="t('updateCheck')">🔄</button>
+            <button class="ghost" @click="exportConfig" :title="t('exportCfgTip')">{{ t("exportCfg") }}</button>
+            <button class="ghost" @click="importConfig" :title="t('importCfgTip')">{{ pendingImport ? t("importConfirmShort") : t("importCfg") }}</button>
           </div>
         </div>
         <div v-if="roots.length" class="roots-row">

@@ -866,6 +866,18 @@ fn load_favs(app: tauri::AppHandle) -> Result<Vec<String>, String> {
     Ok(serde_json::from_str::<Vec<String>>(&content).unwrap_or_default())
 }
 
+/// 导出配置到用户选择的文件（数据由前端组装为 JSON 字符串）
+#[tauri::command]
+fn export_config(path: String, data: String) -> Result<(), String> {
+    std::fs::write(&path, data).map_err(|e| e.to_string())
+}
+
+/// 读取用户选择的配置文件内容（返回原始 JSON，由前端解析并应用）
+#[tauri::command]
+fn import_config(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path).map_err(|e| e.to_string())
+}
+
 fn app_config_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -1019,6 +1031,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             scan_repos,
             get_statuses,
@@ -1040,7 +1053,9 @@ pub fn run() {
             clone_repo,
             stash_repos,
             stash_pop_repos,
-            get_log
+            get_log,
+            export_config,
+            import_config
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
