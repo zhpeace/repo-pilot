@@ -4,7 +4,7 @@
 
 ## 界面
 
-![RepoPilot 界面](docs/screenshot.png)
+![RepoPilot 界面演示](docs/repopilot-demo.gif)
 
 ## 功能
 
