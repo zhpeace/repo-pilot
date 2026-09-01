@@ -21,6 +21,7 @@ struct BatchProgress {
 struct RepoEntry {
     path: String,
     name: String,
+    parent: Option<String>,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -108,7 +109,7 @@ fn is_git_repo(dir: &Path) -> bool {
     dir.join(".git").exists()
 }
 
-fn scan_dir(dir: &Path, out: &mut Vec<RepoEntry>, depth: usize) {
+fn scan_dir(dir: &Path, out: &mut Vec<RepoEntry>, depth: usize, parent: Option<&Path>) {
     if depth > 8 {
         return;
     }
@@ -128,12 +129,16 @@ fn scan_dir(dir: &Path, out: &mut Vec<RepoEntry>, depth: usize) {
             continue;
         }
         if is_git_repo(&path) {
+            let parent_path = parent.map(|p| p.to_string_lossy().to_string());
             out.push(RepoEntry {
                 path: path.to_string_lossy().to_string(),
                 name,
+                parent: parent_path,
             });
+            // 继续深入收集嵌套子仓库（如 src/modules 下的独立仓库），并记录父子关系
+            scan_dir(&path, out, depth + 1, Some(&path));
         } else {
-            scan_dir(&path, out, depth + 1);
+            scan_dir(&path, out, depth + 1, parent);
         }
     }
 }
@@ -153,9 +158,11 @@ fn scan_repos(root: String) -> Vec<RepoEntry> {
         out.push(RepoEntry {
             path: root_path.to_string_lossy().to_string(),
             name,
+            parent: None,
         });
+        scan_dir(&root_path, &mut out, 0, Some(&root_path));
     } else {
-        scan_dir(&root_path, &mut out, 0);
+        scan_dir(&root_path, &mut out, 0, None);
     }
     out
 }
@@ -839,6 +846,26 @@ fn load_roots(app: tauri::AppHandle) -> Result<Vec<String>, String> {
     Ok(Vec::new())
 }
 
+/// 保存收藏的仓库路径，存 favs.json
+#[tauri::command]
+fn save_favs(app: tauri::AppHandle, paths: Vec<String>) -> Result<(), String> {
+    let dir = app_config_dir(&app)?;
+    let json = serde_json::to_string_pretty(&paths).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("favs.json"), json).map_err(|e| e.to_string())
+}
+
+/// 读取收藏的仓库路径
+#[tauri::command]
+fn load_favs(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    let dir = app_config_dir(&app)?;
+    let file = dir.join("favs.json");
+    if !file.exists() {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(&file).map_err(|e| e.to_string())?;
+    Ok(serde_json::from_str::<Vec<String>>(&content).unwrap_or_default())
+}
+
 fn app_config_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -879,6 +906,36 @@ fn load_groups(app: tauri::AppHandle) -> Result<GroupState, String> {
         return Ok(GroupState { names, assign: old });
     }
     Ok(GroupState::default())
+}
+
+/// 列出仓库的可用分支（本地 + 远程名去重，去掉 origin/HEAD，远程分支简化为分支名）
+#[tauri::command]
+fn list_branches(path: String) -> Vec<String> {
+    let dir = Path::new(&path);
+    let Ok(raw) = run_git(
+        dir,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes"],
+    ) else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.ends_with("/HEAD") {
+            continue;
+        }
+        // 远程分支 origin/dev → dev；本地分支 dev 直接保留（本地优先，先输出本地再输出远程）
+        let short = match line.find('/') {
+            Some(idx) => line[idx + 1..].to_string(),
+            None => line.to_string(),
+        };
+        if seen.insert(short.clone()) {
+            out.push(short);
+        }
+    }
+    out.sort();
+    out
 }
 
 /// 批量切换分支：对每个仓库执行 git switch {branch}
@@ -973,7 +1030,10 @@ pub fn run() {
             load_roots,
             save_groups,
             load_groups,
+            save_favs,
+            load_favs,
             switch_branches,
+            list_branches,
             open_terminal,
             list_changes,
             commit_files,

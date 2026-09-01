@@ -18,6 +18,14 @@ interface RepoStatus {
   behind: number;
   last_commit?: number | null;
   error?: string | null;
+  parent?: string | null;
+}
+interface Row {
+  r: RepoStatus;
+  depth: number;
+  hasChildren: boolean;
+  expanded: boolean;
+  seq: string;
 }
 interface OpResult {
   path: string;
@@ -63,12 +71,15 @@ const oldUrl = ref("");
 const newUrl = ref("");
 const customCmd = ref("");
 const switchBranch = ref("");
+const branchOptions = ref<string[]>([]);
+const branchSrc = ref("");
 const autoRefresh = ref(false);
 const countdown = ref(0);
 const lastRefresh = ref("");
 const busy = ref(false);
 const pendingConfirm = ref<"" | "push" | "replace" | "stashpop">("");
 const selected = ref<Set<string>>(new Set());
+const expanded = ref<Set<string>>(new Set());
 const dark = ref(false);
 try {
   dark.value = localStorage.getItem("repopilot-dark") === "1";
@@ -126,8 +137,12 @@ const messages: Record<Lang, Record<string, string>> = {
     dark: "🌙 深色",
     light: "☀️ 浅色",
     deselect: "取消选择",
-    selectAll: "全选当前({n})",
+    selectVisible: "全选当前({n})",
     selected: "已选 {a} / {b}",
+    showOfTotal: "当前显示 {a} / {b}",
+    copyUrl: "复制 URL",
+    logCopied: "已复制：{u}",
+    logCopyFail: "复制失败，请手动复制",
     autoRefresh: "自动刷新",
     lastRefresh: "上次刷新 {t}",
     searchPlaceholder: "搜索仓库/路径/分支/地址…",
@@ -180,6 +195,8 @@ const messages: Record<Lang, Record<string, string>> = {
     colRemote: "Remote 地址",
     colPath: "路径",
     colOps: "操作",
+    expand: "展开子仓库",
+    collapse: "折叠子仓库",
     bErr: "错误",
     bDirty: "有改动",
     bClean: "干净",
@@ -192,7 +209,8 @@ const messages: Record<Lang, Record<string, string>> = {
     swTitle: "批量切换分支（对选中的仓库执行 git switch）",
     swPlaceholder: "分支名，如 dev / feature/login",
     swRun: "批量切换",
-    swHint: "仅切换到已存在的分支；分支不存在会在日志中报错，不会自动创建。",
+    swHint: "可点击输入框从已勾选仓库的下拉选择分支（多选显示所有仓库的共同分支）；仅切换到已存在的分支，不存在会报错。",
+    swFrom: "共同分支",
     rpTitle: "批量替换 Remote 地址（服务器迁移 / 域名变更）",
     rpOld: "旧地址串，如 gitlab.old.com",
     rpNew: "新地址串，如 gitlab.new.com",
@@ -241,6 +259,10 @@ const messages: Record<Lang, Record<string, string>> = {
     emptyNoStatus: "没有“{s}”状态的仓库",
     emptyNoMatch: "没有匹配的仓库",
     emptyNoUngrouped: "没有未分组的仓库",
+    favs: "收藏",
+    favAdd: "收藏",
+    favRemove: "取消收藏",
+    emptyNoFav: "还没有收藏的仓库，点击仓库名旁的 ☆ 收藏",
     emptyGroupHint:
       "「{g}」分组暂无仓库——点上方『全部』，在表格中对仓库选择该分组即可归类",
     relNow: "刚刚",
@@ -272,6 +294,7 @@ const messages: Record<Lang, Record<string, string>> = {
     logGroupDeleted: "已删除分组「{g}」及其子分组",
     logGroupDelConfirm: "再次点击「删除该组」确认删除「{g}」",
     logGroupSaveFail: "保存分组失败: {e}",
+    logFavFail: "保存收藏失败: {e}",
     logGroupAssigned: "「{p}」→ 分组「{g}」",
     logGroupCleared: "「{p}」已移出分组",
     logFinderFail: "打开目录失败: {e}",
@@ -304,8 +327,12 @@ const messages: Record<Lang, Record<string, string>> = {
     dark: "🌙 Dark",
     light: "☀️ Light",
     deselect: "Deselect",
-    selectAll: "Select all ({n})",
+    selectVisible: "Select visible ({n})",
     selected: "{a} / {b} selected",
+    showOfTotal: "Showing {a} of {b}",
+    copyUrl: "Copy URL",
+    logCopied: "Copied: {u}",
+    logCopyFail: "Copy failed, please copy manually",
     autoRefresh: "Auto refresh",
     lastRefresh: "Last refresh {t}",
     searchPlaceholder: "Search name/path/branch/url…",
@@ -358,6 +385,8 @@ const messages: Record<Lang, Record<string, string>> = {
     colRemote: "Remote URL",
     colPath: "Path",
     colOps: "Actions",
+    expand: "Expand",
+    collapse: "Collapse",
     bErr: "Error",
     bDirty: "Dirty",
     bClean: "Clean",
@@ -371,7 +400,8 @@ const messages: Record<Lang, Record<string, string>> = {
     swTitle: "Switch branch on selected repos (git switch)",
     swPlaceholder: "Branch name, e.g. dev / feature/login",
     swRun: "Switch",
-    swHint: "Only switches to existing branches; missing branch reports an error.",
+    swHint: "Click the input to pick a branch (multiple repos show only common branches); only switches to existing branches.",
+    swFrom: "Common branches",
     rpTitle: "Bulk replace Remote URLs (server migration / domain change)",
     rpOld: "Old string, e.g. gitlab.old.com",
     rpNew: "New string, e.g. gitlab.new.com",
@@ -420,6 +450,10 @@ const messages: Record<Lang, Record<string, string>> = {
     emptyNoStatus: "No repos with status “{s}”",
     emptyNoMatch: "No matching repos",
     emptyNoUngrouped: "No ungrouped repos",
+    favs: "Favorites",
+    favAdd: "Favorite",
+    favRemove: "Unfavorite",
+    emptyNoFav: "No favorites yet — click ☆ next to a repo name to favorite it",
     emptyGroupHint:
       "Group “{g}” has no repos — go to All and assign repos to this group in the table",
     relNow: "just now",
@@ -449,6 +483,7 @@ const messages: Record<Lang, Record<string, string>> = {
     logReplaceDone: "Replace done: {ok}/{total} ok",
     logGroupCreated: "Group created: {g}",
     logGroupDeleted: "Deleted group “{g}” and its children",
+    logFavFail: "Failed to save favorites: {e}",
     logGroupDelConfirm: "Click Delete again to confirm deleting “{g}”",
     logGroupSaveFail: "Failed to save groups: {e}",
     logGroupAssigned: "“{p}” → group “{g}”",
@@ -569,6 +604,7 @@ const search = ref("");
 const groups = ref<Record<string, string>>({});
 const groupNames = ref<string[]>([]);
 const activeGroup = ref("");
+const favs = ref<Set<string>>(new Set());
 function isUnder(assign: string | undefined, target: string) {
   return !!assign && (assign === target || assign.startsWith(target + "/"));
 }
@@ -602,9 +638,11 @@ function toggleCollapse(path: string) {
   else s.add(path);
   collapsed.value = s;
 }
-// 只显示未折叠的节点
+// 只显示未折叠、且非空（自身或其子分组有仓库）的节点
 const visibleTree = computed(() =>
   groupNodes.value.filter((n) => {
+    // 空分组（含所有后代）隐藏，只显示到有仓库的那层
+    if (groupCount(n.path) === 0) return false;
     const parts = n.path.split("/");
     for (let i = 1; i < parts.length; i++) {
       if (collapsed.value.has(parts.slice(0, i).join("/"))) return false;
@@ -626,6 +664,15 @@ function setRepoGroup(path: string, name: string) {
   else delete g[path];
   groups.value = g;
   persistGroups();
+}
+function toggleFav(path: string) {
+  const s = new Set(favs.value);
+  if (s.has(path)) s.delete(path);
+  else s.add(path);
+  favs.value = s;
+  invoke("save_favs", { paths: [...s] }).catch((e) =>
+    addLog(tr("logFavFail", { e: String(e) }))
+  );
 }
 const showNewGroup = ref(false);
 const newGroupName = ref("");
@@ -684,7 +731,9 @@ const baseFiltered = computed(() => {
         .toLowerCase()
         .includes(q)
     );
-  if (activeGroup.value === "__none")
+  if (activeGroup.value === "__fav")
+    list = list.filter((r) => favs.value.has(r.path));
+  else if (activeGroup.value === "__none")
     list = list.filter((r) => !groups.value[r.path]);
   else if (activeGroup.value)
     list = list.filter((r) => isUnder(groups.value[r.path], activeGroup.value));
@@ -738,10 +787,89 @@ const emptyHint = computed(() => {
   }
   if (commitFilter.value !== "all") return t("emptyNoCommit");
   if (search.value.trim()) return t("emptyNoMatch");
+  if (activeGroup.value === "__fav") return t("emptyNoFav");
   if (activeGroup.value === "__none") return t("emptyNoUngrouped");
   if (activeGroup.value) return tr("emptyGroupHint", { g: activeGroup.value });
   return "";
 });
+
+// ===== 嵌套仓库树 =====
+// 把过滤后的仓库按父子关系展开为树形行序列：父仓库可展开/折叠，子仓库缩进显示
+const visibleRows = computed<Row[]>(() => {
+  const rows: Row[] = [];
+  const list = filteredRepos.value;
+  const inList = new Set(list.map((x) => x.path));
+  const childrenMap = new Map<string, RepoStatus[]>();
+  for (const r of list) {
+    if (r.parent && inList.has(r.parent)) {
+      if (!childrenMap.has(r.parent)) childrenMap.set(r.parent, []);
+      childrenMap.get(r.parent)!.push(r);
+    }
+  }
+  const emitted = new Set<string>();
+  const emitChildren = (parentPath: string, depth: number, prefix: string) => {
+    const kids = childrenMap.get(parentPath) ?? [];
+    let idx = 0;
+    for (const k of kids) {
+      if (emitted.has(k.path)) continue;
+      emitted.add(k.path);
+      const hasCh = !!childrenMap.get(k.path)?.length;
+      const isExp = expanded.value.has(k.path);
+      idx += 1;
+      const seq = `${prefix}.${idx}`;
+      rows.push({ r: k, depth, hasChildren: hasCh, expanded: isExp, seq });
+      if (hasCh && isExp) emitChildren(k.path, depth + 1, seq);
+    }
+  };
+  let top = 0;
+  for (const r of list) {
+    if (emitted.has(r.path)) continue;
+    // 子仓库由父仓库展开统一输出，不单独作为顶层行（父被过滤掉时则作为孤儿顶层显示）
+    if (r.parent && inList.has(r.parent)) continue;
+    // 顶层：无 parent 或 parent 已被过滤掉
+    const hasCh = !!childrenMap.get(r.path)?.length;
+    const isExp = expanded.value.has(r.path);
+    top += 1;
+    const seq = String(top);
+    rows.push({ r, depth: 0, hasChildren: hasCh, expanded: isExp, seq });
+    emitted.add(r.path);
+    if (hasCh && isExp) emitChildren(r.path, 1, seq);
+  }
+  return rows;
+});
+function toggleExpand(path: string) {
+  const s = new Set(expanded.value);
+  if (s.has(path)) s.delete(path);
+  else s.add(path);
+  expanded.value = s;
+}
+function childCount(path: string): number {
+  return repos.value.filter((r) => r.parent === path).length;
+}
+// 直接子仓库中有改动/错误的数量（用于父仓库脏状态角标）
+function childDirtyCount(path: string): number {
+  return repos.value.filter((r) => r.parent === path && (r.dirty || !!r.error)).length;
+}
+// 当前是否有搜索/筛选/分组过滤在生效
+const filterHint = computed(() => {
+  const n = filteredRepos.value.length;
+  const total = repos.value.length;
+  const hasFilter =
+    !!search.value.trim() ||
+    !!statusFilter.value ||
+    commitFilter.value !== "all" ||
+    !!activeGroup.value;
+  if (!hasFilter || n === total || total === 0) return "";
+  return tr("showOfTotal", { a: n, b: total });
+});
+async function copyUrl(url: string) {
+  try {
+    await navigator.clipboard.writeText(url);
+    addLog(tr("logCopied", { u: url }));
+  } catch {
+    addLog(t("logCopyFail"));
+  }
+}
 
 // 把 git remote 地址转成网页可打开的 URL（https 直用，ssh/git@ 转 https）
 function remoteToWeb(url: string): string | null {
@@ -1028,11 +1156,16 @@ async function scan() {
   try {
     const all = new Map<string, RepoStatus>();
     for (const r of roots.value) {
-      const entries: { path: string }[] = await invoke("scan_repos", { root: r });
+      const entries: { path: string; parent?: string | null }[] = await invoke("scan_repos", { root: r });
+      const parentMap = new Map<string, string | null>();
+      for (const e of entries) parentMap.set(e.path, e.parent ?? null);
       const paths = entries.map((e) => e.path);
       if (!paths.length) continue;
       const statuses: RepoStatus[] = await invoke("get_statuses", { paths });
-      for (const s of statuses) all.set(s.path, s);
+      for (const s of statuses) {
+        s.parent = parentMap.get(s.path) ?? null;
+        all.set(s.path, s);
+      }
     }
     repos.value = [...all.values()];
     // 默认不勾选任何仓库，需要操作时用「全选当前」或手动勾选（安全优先）
@@ -1115,6 +1248,12 @@ onMounted(async () => {
     /* 无分组配置 */
   }
   try {
+    const savedFavs: string[] = await invoke("load_favs");
+    favs.value = new Set(savedFavs);
+  } catch {
+    /* 无收藏配置 */
+  }
+  try {
     const savedRoots: string[] = await invoke("load_roots");
     if (savedRoots.length) {
       roots.value = savedRoots;
@@ -1137,7 +1276,12 @@ async function updateBadge() {
 async function refreshStatus(silent = false) {
   const paths = repos.value.map((r) => r.path);
   if (!paths.length) return;
-  repos.value = await invoke("get_statuses", { paths });
+  // 保留旧的父子关系（get_statuses 不返回 parent，刷新时不能丢）
+  const oldParent = new Map<string, string | null>();
+  for (const r of repos.value) oldParent.set(r.path, r.parent ?? null);
+  const statuses: RepoStatus[] = await invoke("get_statuses", { paths });
+  for (const s of statuses) s.parent = oldParent.get(s.path) ?? null;
+  repos.value = statuses;
   lastRefresh.value = new Date().toLocaleTimeString();
   void updateBadge();
   if (!silent) addLog(t("logRefreshed"));
@@ -1266,6 +1410,35 @@ async function runSwitchBranch() {
   }
 }
 
+// 勾选变化时，从选中仓库加载可用分支（交集：所有选中仓库都有的分支，保证批量切换成功）
+watch(
+  selected,
+  async () => {
+    const paths = [...selected.value].slice(0, 20);
+    if (!paths.length) {
+      branchOptions.value = [];
+      branchSrc.value = "";
+      return;
+    }
+    try {
+      const lists = await Promise.all(
+        paths.map((p) => invoke<string[]>("list_branches", { path: p }))
+      );
+      const sets = lists.map((l) => new Set(l));
+      const inter = [...sets[0]].filter((b) => sets.every((s) => s.has(b))).sort((a, b) => a.localeCompare(b, "zh"));
+      branchOptions.value = inter;
+      branchSrc.value =
+        paths.length === 1
+          ? (paths[0].split("/").pop() ?? "")
+          : `${inter.length} / ${paths.length}`;
+    } catch {
+      branchOptions.value = [];
+      branchSrc.value = "";
+    }
+  },
+  { immediate: true }
+);
+
 async function replaceRemote() {
   const paths = [...selected.value];
   if (!paths.length) return addLog(t("logNoSel"));
@@ -1309,31 +1482,37 @@ async function replaceRemote() {
       <h1>{{ t("appTitle") }}</h1>
       <div class="topbar-main">
         <div class="scan-row">
-          <input
-            v-model="rootInput"
-            :placeholder="t('addRootPlaceholder')"
-            @keyup.enter="addRoot"
-          />
-          <button class="ghost" @click="addRoot" :disabled="!rootInput.trim()">
-            {{ t("addRoot") }}
-          </button>
-          <button :disabled="scanning || !roots.length" @click="scan">
-            {{ scanning ? t("scanning") : t("scanAll") }}
-          </button>
-          <button class="ghost" @click="openClone" :disabled="!roots.length" :title="t('cloneTitle')">
-            {{ t("cloneRun") }}
-          </button>
-          <button class="ghost" @click="refreshStatus(false)" :disabled="!repos.length" :title="t('titleRefresh')">
-            {{ t("refresh") }}
-          </button>
-          <button class="ghost" @click="lang = lang === 'zh' ? 'en' : 'zh'" :title="lang === 'zh' ? 'Switch to English' : '切换中文'">
-            {{ lang === "zh" ? "EN" : "中文" }}
-          </button>
-          <button class="ghost theme-btn" @click="dark = !dark">
-            {{ dark ? t("light") : t("dark") }}
-          </button>
-          <button class="ghost" @click="showAbout = true" title="About">ⓘ</button>
-          <button class="ghost" @click="checkUpdate(true)" :title="t('updateCheck')">🔄</button>
+          <div class="tool-group input-grp">
+            <input
+              v-model="rootInput"
+              :placeholder="t('addRootPlaceholder')"
+              @keyup.enter="addRoot"
+            />
+            <button class="ghost" @click="addRoot" :disabled="!rootInput.trim()">
+              {{ t("addRoot") }}
+            </button>
+          </div>
+          <div class="tool-group">
+            <button :disabled="scanning || !roots.length" @click="scan">
+              {{ scanning ? t("scanning") : t("scanAll") }}
+            </button>
+            <button class="ghost" @click="openClone" :disabled="!roots.length" :title="t('cloneTitle')">
+              {{ t("cloneRun") }}
+            </button>
+            <button class="ghost" @click="refreshStatus(false)" :disabled="!repos.length" :title="t('titleRefresh')">
+              {{ t("refresh") }}
+            </button>
+          </div>
+          <div class="tool-group">
+            <button class="ghost" @click="lang = lang === 'zh' ? 'en' : 'zh'" :title="lang === 'zh' ? 'Switch to English' : '切换中文'">
+              {{ lang === "zh" ? "EN" : "中文" }}
+            </button>
+            <button class="ghost theme-btn" @click="dark = !dark">
+              {{ dark ? t("light") : t("dark") }}
+            </button>
+            <button class="ghost" @click="showAbout = true" title="About">ⓘ</button>
+            <button class="ghost" @click="checkUpdate(true)" :title="t('updateCheck')">🔄</button>
+          </div>
         </div>
         <div v-if="roots.length" class="roots-row">
           <span v-for="r in roots" :key="r" class="root-chip">
@@ -1365,6 +1544,15 @@ async function replaceRemote() {
             <span class="tw"></span>
             <span class="tn">{{ t("ungrouped") }}</span>
             <span class="cnt">{{ ungroupedCount }}</span>
+          </div>
+          <div
+            class="tree-node"
+            :class="{ on: activeGroup === '__fav' }"
+            @click="activeGroup = '__fav'"
+          >
+            <span class="tw">⭐</span>
+            <span class="tn">{{ t("favs") }}</span>
+            <span class="cnt">{{ favs.size }}</span>
           </div>
           <div
             v-for="node in visibleTree"
@@ -1412,7 +1600,7 @@ async function replaceRemote() {
       <div class="content">
       <div class="toolbar">
         <button @click="toggleAll">
-          {{ viewAllSelected ? t("deselect") : tr("selectAll", { n: filteredRepos.length }) }}
+          {{ viewAllSelected ? t("deselect") : tr("selectVisible", { n: filteredRepos.length }) }}
         </button>
         <span class="count">{{ tr("selected", { a: selected.size, b: repos.length }) }}</span>
         <label class="auto">
@@ -1463,13 +1651,14 @@ async function replaceRemote() {
           <span class="sc">{{ c.count }}</span>
         </button>
       </div>
+      <div v-if="filterHint" class="filter-hint">{{ filterHint }}</div>
 
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
               <th class="idx">{{ t("colIdx") }}</th>
-              <th></th>
+              <th class="chk"></th>
               <th class="sortable" @click="setSort('name')">{{ t("colName") }} {{ sortArrow('name') }}</th>
               <th class="grp">{{ t("colGroup") }}</th>
               <th class="sortable" @click="setSort('branch')">{{ t("colBranch") }} {{ sortArrow('branch') }}</th>
@@ -1483,24 +1672,43 @@ async function replaceRemote() {
           </thead>
           <tbody>
             <tr
-              v-for="(r, i) in filteredRepos"
-              :key="r.path"
-              :class="{ off: !selected.has(r.path) }"
-              @contextmenu="openCtx($event, r)"
+              v-for="row in visibleRows"
+              :key="row.r.path"
+              :class="{ off: !selected.has(row.r.path) }"
+              @contextmenu="openCtx($event, row.r)"
             >
-              <td class="idx">{{ i + 1 }}</td>
-              <td>
+              <td class="idx">{{ row.seq }}</td>
+              <td class="chk">
                 <input
                   type="checkbox"
-                  :checked="selected.has(r.path)"
-                  @change="toggle(r.path)"
+                  :checked="selected.has(row.r.path)"
+                  @change="toggle(row.r.path)"
                 />
               </td>
-              <td class="name">{{ r.path.split("/").pop() }}</td>
+              <td class="name">
+                <span class="tree-cell" :style="{ 'padding-left': row.depth * 20 + 'px' }">
+                  <button
+                    v-if="row.hasChildren"
+                    class="twist"
+                    :title="row.expanded ? t('collapse') : t('expand')"
+                    @click.stop="toggleExpand(row.r.path)"
+                  >{{ row.expanded ? "▾" : "▸" }}</button>
+                  <span v-else class="twist ph"></span>
+                  <span class="tree-name">{{ row.r.path.split("/").pop() }}</span>
+                  <button
+                    class="fav"
+                    :title="favs.has(row.r.path) ? t('favRemove') : t('favAdd')"
+                    :class="{ on: favs.has(row.r.path) }"
+                    @click.stop="toggleFav(row.r.path)"
+                  >{{ favs.has(row.r.path) ? "★" : "☆" }}</button>
+                  <span v-if="row.hasChildren" class="child-badge">{{ childCount(row.r.path) }}</span>
+                  <span v-if="row.hasChildren && childDirtyCount(row.r.path)" class="child-badge warn">⚠{{ childDirtyCount(row.r.path) }}</span>
+                </span>
+              </td>
               <td class="grp">
                 <select
-                  :value="groups[r.path] || ''"
-                  @change="setRepoGroup(r.path, ($event.target as HTMLSelectElement).value)"
+                  :value="groups[row.r.path] || ''"
+                  @change="setRepoGroup(row.r.path, ($event.target as HTMLSelectElement).value)"
                 >
                   <option value="">{{ t("ungrouped") }}</option>
                   <option v-for="node in groupNodes" :key="node.path" :value="node.path">
@@ -1508,31 +1716,41 @@ async function replaceRemote() {
                   </option>
                 </select>
               </td>
-              <td>{{ r.branch || "—" }}</td>
+              <td>{{ row.r.branch || "—" }}</td>
               <td>
-                <span v-if="r.error" class="badge err">{{ t("bErr") }}</span>
+                <span v-if="row.r.error" class="badge err">{{ t("bErr") }}</span>
                 <span
-                  v-else-if="r.dirty"
+                  v-else-if="row.r.dirty"
                   class="badge dirty tipable"
-                  @mouseenter="showChanges($event, r)"
+                  @mouseenter="showChanges($event, row.r)"
                   @mouseleave="hideChangesDelayed"
-                >{{ t("bDirty") }}{{ r.changed ? ` ×${r.changed}` : "" }}</span>
+                >{{ t("bDirty") }}{{ row.r.changed ? ` ×${row.r.changed}` : "" }}</span>
                 <span v-else class="badge clean">{{ t("bClean") }}</span>
               </td>
               <td>
-                <span v-if="r.ahead" class="ahead">↑{{ r.ahead }}</span>
-                <span v-if="r.behind" class="behind">↓{{ r.behind }}</span>
-                <span v-if="!r.ahead && !r.behind" class="muted">{{ t("sync") }}</span>
+                <span v-if="row.r.ahead" class="ahead">↑{{ row.r.ahead }}</span>
+                <span v-if="row.r.behind" class="behind">↓{{ row.r.behind }}</span>
+                <span v-if="!row.r.ahead && !row.r.behind" class="muted">{{ t("sync") }}</span>
               </td>
-              <td class="commit">{{ relTime(r.last_commit) }}</td>
-              <td class="url" :title="r.remote_url">{{ r.remote_url || t("noRemote") }}</td>
-              <td class="path" :title="r.path">{{ r.path }}</td>
+              <td class="commit">{{ relTime(row.r.last_commit) }}</td>
+              <td class="url" :title="row.r.remote_url">
+                <span class="url-cell">
+                  <span class="url-text">{{ row.r.remote_url || t("noRemote") }}</span>
+                  <button
+                    v-if="row.r.remote_url"
+                    class="mini copy"
+                    :title="t('copyUrl')"
+                    @click.stop="copyUrl(row.r.remote_url)"
+                  >📋</button>
+                </span>
+              </td>
+              <td class="path" :title="row.r.path">{{ row.r.path }}</td>
               <td class="ops">
-                <button class="mini" :title="t('ctxFinder')" @click="openInFinder(r.path)">📂</button>
-                <button class="mini" :title="t('ctxTerm')" @click="openTerm(r.path)">>_</button>
-                <button class="mini" :title="t('ctxCommit')" @click="openCommit(r)">📝</button>
-                <button class="mini" :title="t('ctxLog')" @click="openLog(r)">🕘</button>
-                <button class="mini" :title="t('ctxWeb')" @click="openRemotePage(r)">🌐</button>
+                <button class="mini" :title="t('ctxFinder')" @click="openInFinder(row.r.path)">📂</button>
+                <button class="mini" :title="t('ctxTerm')" @click="openTerm(row.r.path)">>_</button>
+                <button class="mini" :title="t('ctxCommit')" @click="openCommit(row.r)">📝</button>
+                <button class="mini" :title="t('ctxLog')" @click="openLog(row.r)">🕘</button>
+                <button class="mini" :title="t('ctxWeb')" @click="openRemotePage(row.r)">🌐</button>
               </td>
             </tr>
             <tr v-if="!filteredRepos.length">
@@ -1542,6 +1760,7 @@ async function replaceRemote() {
         </table>
       </div>
 
+      <div class="panels-grid">
       <div class="panel cmd">
         <h3>{{ t("cmdTitle") }}</h3>
         <div class="cmd-row">
@@ -1562,14 +1781,21 @@ async function replaceRemote() {
         <div class="cmd-row">
           <input
             v-model="switchBranch"
+            list="branch-options"
             :placeholder="t('swPlaceholder')"
             @keyup.enter="runSwitchBranch"
           />
           <button @click="runSwitchBranch" :disabled="!selected.size || busy">
             {{ t("swRun") }}
           </button>
+          <datalist id="branch-options">
+            <option v-for="b in branchOptions" :key="b" :value="b" />
+          </datalist>
         </div>
-        <p class="hint">{{ t("swHint") }}</p>
+        <p class="hint">
+          {{ t("swHint") }}
+          <span v-if="branchOptions.length" class="hint-src">· {{ t("swFrom") }} {{ branchSrc }}</span>
+        </p>
       </div>
 
       <div class="panel replace">
@@ -1591,6 +1817,7 @@ async function replaceRemote() {
           <li v-for="(l, i) in log" :key="i">{{ l }}</li>
         </ul>
         <p v-else class="hint">{{ t("noLog") }}</p>
+      </div>
       </div>
       </div>
     </div>
@@ -1764,7 +1991,11 @@ body { margin: 0; }
 }
 .topbar { position: relative; }
 .topbar-main { display: flex; flex-direction: column; gap: 8px; flex: 1; min-width: 320px; }
-.scan-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.scan-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.tool-group { display: flex; gap: 6px; align-items: center; }
+.tool-group.input-grp { flex: 1 1 320px; }
+.tool-group.input-grp input { flex: 1; min-width: 200px; }
+.tool-group + .tool-group { padding-left: 10px; border-left: 1px solid #ffffff2e; }
 .roots-row { display: flex; flex-wrap: wrap; gap: 6px; }
 .root-chip {
   background: #ffffff22;
@@ -1844,7 +2075,7 @@ html.dark .topbar button.ghost:hover { border-color: #fff; color: #fff; }
 .tree-node:hover { background: #f6f8fa; }
 .tree-node.on { background: #0969da; color: #fff; }
 .tree-node.on .tw, .tree-node.on .cnt { color: #ddf4ff; }
-.tree-node .tw { width: 14px; flex-shrink: 0; text-align: center; color: #57606a; font-size: 10px; }
+.tree-node .tw { width: 20px; flex-shrink: 0; text-align: center; color: #57606a; font-size: 20px; line-height: 1; }
 .tree-node .tn { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .cnt { margin-left: 4px; opacity: 0.7; font-size: 11px; }
 .tree-actions { margin-top: auto; display: flex; flex-direction: column; gap: 6px; padding-top: 8px; border-top: 1px solid #eaeef2; }
@@ -1871,14 +2102,43 @@ html.dark .busy-tip.bad { background: #f8514926; color: #f85149; }
 html.dark .busy-tip.upd { background: #316dca; color: #fff; }
 .spacer { flex: 1; }
 .table-wrap { flex: 1; overflow: auto; background: #fff; border: 1px solid #d0d7de; border-radius: 8px; }
-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+table { width: 100%; min-width: 1080px; border-collapse: collapse; font-size: 13px; }
 th, td { padding: 7px 10px; text-align: left; border-bottom: 1px solid #eaeef2; white-space: nowrap; }
-th { background: #f6f8fa; position: sticky; top: 0; color: #57606a; font-weight: 600; }
+th { background: #f6f8fa; position: sticky; top: 0; z-index: 2; color: #57606a; font-weight: 600; }
+/* 横向滚动时序号列与勾选列吸附左侧 */
+th.idx, td.idx, th.chk, td.chk { position: sticky; }
+th.idx { left: 0; z-index: 4; }
+th.chk { left: 36px; z-index: 4; }
+td.idx { left: 0; z-index: 3; background: #fff; }
+td.chk { left: 36px; z-index: 3; background: #fff; }
+.chk { width: 40px; text-align: center; }
+html.dark td.idx, html.dark td.chk { background: #1c2128; }
+.filter-hint { font-size: 12px; color: #8c959f; padding: 4px 2px 0; }
+.url-cell { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; }
+.url-text { overflow: hidden; text-overflow: ellipsis; }
+td.url .copy { visibility: hidden; padding: 0 5px; }
+td.url:hover .copy { visibility: visible; }
+.child-badge.warn { background: #fff8c5; color: #9a6700; }
+html.dark .child-badge.warn { background: #9e6a0333; color: #d29922; }
 th.sortable { cursor: pointer; user-select: none; }
 th.sortable:hover { color: #0969da; }
 .idx { width: 36px; text-align: center; color: #8c959f; }
-tr.off td { opacity: 0.5; }
+tr.off td { opacity: 0.85; }
 td.name { font-weight: 600; }
+.tree-cell { display: inline-flex; align-items: center; gap: 2px; }
+.twist { width: 24px; height: 32px; padding: 0; border: none; background: none; cursor: pointer; color: #57606a; font-size: 20px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.twist:hover { color: #0969da; }
+.twist.ph { visibility: hidden; }
+.tree-name { white-space: nowrap; }
+.fav { padding: 0 2px; border: none; background: none; cursor: pointer; font-size: 14px; line-height: 1; color: #8c959f; flex-shrink: 0; }
+.fav:hover { color: #eac54f; }
+.fav.on { color: #eac54f; }
+html.dark .fav { color: #8b949e; }
+html.dark .fav:hover, html.dark .fav.on { color: #f0c648; }
+.child-badge { background: #ddf4ff; color: #0969da; border-radius: 9px; font-size: 11px; padding: 0 6px; line-height: 16px; font-weight: 600; }
+html.dark .twist { color: #9198a1; }
+html.dark .twist:hover { color: #58a6ff; }
+html.dark .child-badge { background: #316dca33; color: #79c0ff; }
 td.path, td.url { max-width: 260px; overflow: hidden; text-overflow: ellipsis; color: #57606a; }
 .ops { width: 120px; text-align: center; }
 .mini { padding: 1px 7px; font-size: 12px; line-height: 1.7; border-color: #d0d7de; }
@@ -1890,11 +2150,15 @@ td.path, td.url { max-width: 260px; overflow: hidden; text-overflow: ellipsis; c
 .behind { color: #cf222e; margin-left: 4px; }
 .muted { color: #8c959f; }
 .empty { text-align: center; color: #8c959f; padding: 30px 0; }
-.panel { background: #fff; border: 1px solid #d0d7de; border-radius: 8px; padding: 12px 14px; }
-.panel h3 { margin: 0 0 10px; font-size: 14px; }
+.panel { background: #fff; border: 1px solid #d0d7de; border-radius: 8px; padding: 10px 12px; }
+.panel h3 { margin: 0 0 6px; font-size: 13px; }
+.panels-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-items: start; }
+.panels-grid .replace, .panels-grid .log { grid-column: 1 / -1; }
 .cmd-row, .replace-row { display: flex; gap: 8px; align-items: center; }
 .arrow { color: #57606a; }
-.hint { color: #8c959f; font-size: 12px; margin: 8px 0 0; }
+.hint { color: #8c959f; font-size: 12px; margin: 6px 0 0; }
+.hint .hint-src { color: #57606a; }
+html.dark .hint .hint-src { color: #8b949e; }
 .log ul { margin: 0; padding: 0; list-style: none; max-height: 160px; overflow: auto; }
 .log li {
   font-size: 12px;
