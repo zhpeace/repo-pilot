@@ -57,7 +57,9 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
         .output()
         .map_err(|e| format!("无法执行 git：{e}"))?;
     if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        // 注意：只用 trim_end，不能 trim() —— porcelain 输出行首是状态码的空位（如 " M file"），
+        // trim() 会把行首空格也去掉，导致 list_changes 按 line[3..] 解析时路径丢失第一个字符
+        Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
     } else {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         Err(if err.is_empty() { "git 命令失败".to_string() } else { err })
@@ -84,7 +86,7 @@ fn run_git_timeout(dir: &Path, args: &[&str], secs: u64) -> Result<String, Strin
                     .wait_with_output()
                     .map_err(|e| format!("读取 git 输出失败：{e}"))?;
                 if out.status.success() {
-                    return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+                    return Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string());
                 } else {
                     let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
                     return Err(if err.is_empty() { "git 命令失败".to_string() } else { err });
@@ -1321,6 +1323,48 @@ mod tests {
         assert!(
             !branches.iter().any(|b| b == "login"),
             "不应出现被截断的分支名 login，实际返回: {branches:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_list_changes_keeps_first_char_of_unstaged_path() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join("repopilot_list_changes_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let init = Command::new("git")
+            .arg("-C").arg(&dir).arg("init").arg("-b").arg("main")
+            .output().unwrap();
+        assert!(init.status.success(), "git init 失败");
+        let _ = Command::new("git")
+            .arg("-C").arg(&dir).arg("config").arg("user.email").arg("t@t")
+            .output().unwrap();
+        let _ = Command::new("git")
+            .arg("-C").arg(&dir).arg("config").arg("user.name").arg("t")
+            .output().unwrap();
+        fs::write(dir.join("a.txt"), "1").unwrap();
+        let _ = Command::new("git").arg("-C").arg(&dir).arg("add").arg(".").output().unwrap();
+        let _ = Command::new("git")
+            .arg("-C").arg(&dir).arg("commit").arg("-m").arg("init")
+            .output().unwrap();
+        // 先提交 src/App.vue，再未暂存修改它：porcelain 输出 " M src/App.vue"（行首空格），
+        // 此前 run_git 的 trim() 去掉行首空格导致路径解析为 "rc/App.vue"
+        let sub = dir.join("src");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("App.vue"), "v1").unwrap();
+        let _ = Command::new("git").arg("-C").arg(&dir).arg("add").arg(".").output().unwrap();
+        let _ = Command::new("git")
+            .arg("-C").arg(&dir).arg("commit").arg("-m").arg("init2")
+            .output().unwrap();
+        fs::write(sub.join("App.vue"), "v2").unwrap();
+
+        let list = list_changes(dir.to_string_lossy().to_string()).unwrap();
+        assert!(
+            list.iter().any(|c| c.path == "src/App.vue"),
+            "未暂存文件路径被错误截断，实际返回: {:?}",
+            list.iter().map(|c| c.path.as_str()).collect::<Vec<_>>()
         );
         let _ = fs::remove_dir_all(&dir);
     }
