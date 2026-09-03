@@ -8,6 +8,11 @@ use std::process::Command;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
+use tokio::sync::Semaphore;
+
+/// 批量 git 操作的最大并发数：一次最多同时跑 N 个仓库，
+/// 避免大批量仓库（如 374 个）同时 SSH/HTTP 握手触发远程限流或界面卡死。
+const MAX_CONCURRENT: usize = 8;
 
 #[derive(Serialize, Clone)]
 struct BatchProgress {
@@ -59,31 +64,74 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// 带超时的 git 调用（用于批量写操作）：stdin 置空避免交互式认证挂起，超时返回明确错误
+/// 带超时的 git 调用（用于批量写操作）：stdin 置空避免交互式认证挂起。
+/// 超时会真正 kill 掉 git 子进程并返回明确错误，避免残留挂死的进程堆积。
 fn run_git_timeout(dir: &Path, args: &[&str], secs: u64) -> Result<String, String> {
-    let dir = dir.to_path_buf();
-    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&dir)
-            .args(&args)
-            .stdin(std::process::Stdio::null())
-            .output();
-        let _ = tx.send(out);
-    });
-    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
-        Ok(Ok(out)) => {
-            if out.status.success() {
-                Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-            } else {
-                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                Err(if err.is_empty() { "git 命令失败".to_string() } else { err })
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("无法执行 git：{e}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let out = child
+                    .wait_with_output()
+                    .map_err(|e| format!("读取 git 输出失败：{e}"))?;
+                if out.status.success() {
+                    return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+                } else {
+                    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    return Err(if err.is_empty() { "git 命令失败".to_string() } else { err });
+                }
             }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("git 命令超时（可能需要认证，请先在终端手动操作一次）".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("等待 git 失败：{e}")),
         }
-        Ok(Err(e)) => Err(format!("无法执行 git：{e}")),
-        Err(_) => Err("git 命令超时（可能需要认证，请先在终端手动操作一次）".to_string()),
+    }
+}
+
+/// 带超时执行 shell 命令（sh -c）：超时 kill 掉命令进程，避免交互式命令残留挂起
+fn run_shell_timeout(cmd: &str, dir: &Path, secs: u64) -> Result<std::process::Output, String> {
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("无法执行命令：{e}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|e| format!("读取命令输出失败：{e}"));
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("命令执行超时（可能等待输入），已中止".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("等待命令失败：{e}")),
+        }
     }
 }
 
@@ -221,10 +269,17 @@ fn get_one_status(path: &str) -> RepoStatus {
 
 #[tauri::command]
 async fn get_statuses(paths: Vec<String>) -> Vec<RepoStatus> {
+    let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let mut handles = Vec::new();
     for p in &paths {
         let p = p.clone();
-        handles.push(tauri::async_runtime::spawn_blocking(move || get_one_status(&p)));
+        let sem = Arc::clone(&sem);
+        handles.push(tauri::async_runtime::spawn(async move {
+            let _perm = sem.acquire().await.expect("semaphore closed");
+            tauri::async_runtime::spawn_blocking(move || get_one_status(&p))
+                .await
+                .unwrap_or_default()
+        }));
     }
     let mut out = Vec::with_capacity(handles.len());
     for h in handles {
@@ -238,40 +293,51 @@ async fn pull_repos(app: tauri::AppHandle, paths: Vec<String>) -> Vec<OpResult> 
     let total = paths.len() as i32;
     let done = Arc::new(AtomicI32::new(0));
     let okc = Arc::new(AtomicI32::new(0));
+    let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let mut handles = Vec::new();
     for p in &paths {
         let p = p.clone();
         let app = app.clone();
         let done = Arc::clone(&done);
         let okc = Arc::clone(&okc);
-        handles.push(tauri::async_runtime::spawn_blocking(move || {
-            let dir = Path::new(&p);
-            let r = match run_git_timeout(dir, &["pull"], 60) {
-                Ok(_) => OpResult {
-                    path: p,
-                    ok: true,
-                    message: "pull 成功".to_string(),
-                },
-                Err(e) => OpResult {
-                    path: p,
-                    ok: false,
-                    message: friendly_git_err(&e),
-                },
-            };
-            if r.ok {
-                okc.fetch_add(1, Ordering::SeqCst);
-            }
-            let d = done.fetch_add(1, Ordering::SeqCst) + 1;
-            let _ = app.emit(
-                "repopilot-progress",
-                BatchProgress {
-                    done: d,
-                    total,
-                    ok: okc.load(Ordering::SeqCst),
-                    path: r.path.clone(),
-                },
-            );
-            r
+        let sem = Arc::clone(&sem);
+        handles.push(tauri::async_runtime::spawn(async move {
+            let _perm = sem.acquire().await.expect("semaphore closed");
+            tauri::async_runtime::spawn_blocking(move || {
+                let dir = Path::new(&p);
+                let r = match run_git_timeout(dir, &["pull"], 60) {
+                    Ok(_) => OpResult {
+                        path: p,
+                        ok: true,
+                        message: "pull 成功".to_string(),
+                    },
+                    Err(e) => OpResult {
+                        path: p,
+                        ok: false,
+                        message: friendly_git_err(&e),
+                    },
+                };
+                if r.ok {
+                    okc.fetch_add(1, Ordering::SeqCst);
+                }
+                let d = done.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = app.emit(
+                    "repopilot-progress",
+                    BatchProgress {
+                        done: d,
+                        total,
+                        ok: okc.load(Ordering::SeqCst),
+                        path: r.path.clone(),
+                    },
+                );
+                r
+            })
+            .await
+            .unwrap_or_else(|_| OpResult {
+                path: "未知".to_string(),
+                ok: false,
+                message: "后台任务失败".to_string(),
+            })
         }));
     }
     let mut results = Vec::with_capacity(handles.len());
@@ -290,40 +356,51 @@ async fn push_repos(app: tauri::AppHandle, paths: Vec<String>) -> Vec<OpResult> 
     let total = paths.len() as i32;
     let done = Arc::new(AtomicI32::new(0));
     let okc = Arc::new(AtomicI32::new(0));
+    let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let mut handles = Vec::new();
     for p in &paths {
         let p = p.clone();
         let app = app.clone();
         let done = Arc::clone(&done);
         let okc = Arc::clone(&okc);
-        handles.push(tauri::async_runtime::spawn_blocking(move || {
-            let dir = Path::new(&p);
-            let r = match run_git_timeout(dir, &["push"], 60) {
-                Ok(_) => OpResult {
-                    path: p,
-                    ok: true,
-                    message: "push 成功".to_string(),
-                },
-                Err(e) => OpResult {
-                    path: p,
-                    ok: false,
-                    message: friendly_git_err(&e),
-                },
-            };
-            if r.ok {
-                okc.fetch_add(1, Ordering::SeqCst);
-            }
-            let d = done.fetch_add(1, Ordering::SeqCst) + 1;
-            let _ = app.emit(
-                "repopilot-progress",
-                BatchProgress {
-                    done: d,
-                    total,
-                    ok: okc.load(Ordering::SeqCst),
-                    path: r.path.clone(),
-                },
-            );
-            r
+        let sem = Arc::clone(&sem);
+        handles.push(tauri::async_runtime::spawn(async move {
+            let _perm = sem.acquire().await.expect("semaphore closed");
+            tauri::async_runtime::spawn_blocking(move || {
+                let dir = Path::new(&p);
+                let r = match run_git_timeout(dir, &["push"], 60) {
+                    Ok(_) => OpResult {
+                        path: p,
+                        ok: true,
+                        message: "push 成功".to_string(),
+                    },
+                    Err(e) => OpResult {
+                        path: p,
+                        ok: false,
+                        message: friendly_git_err(&e),
+                    },
+                };
+                if r.ok {
+                    okc.fetch_add(1, Ordering::SeqCst);
+                }
+                let d = done.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = app.emit(
+                    "repopilot-progress",
+                    BatchProgress {
+                        done: d,
+                        total,
+                        ok: okc.load(Ordering::SeqCst),
+                        path: r.path.clone(),
+                    },
+                );
+                r
+            })
+            .await
+            .unwrap_or_else(|_| OpResult {
+                path: "未知".to_string(),
+                ok: false,
+                message: "后台任务失败".to_string(),
+            })
         }));
     }
     let mut results = Vec::with_capacity(handles.len());
@@ -342,6 +419,7 @@ async fn stash_repos(app: tauri::AppHandle, paths: Vec<String>, include_untracke
     let total = paths.len() as i32;
     let done = Arc::new(AtomicI32::new(0));
     let okc = Arc::new(AtomicI32::new(0));
+    let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let mut handles = Vec::new();
     for p in &paths {
         let p = p.clone();
@@ -349,55 +427,65 @@ async fn stash_repos(app: tauri::AppHandle, paths: Vec<String>, include_untracke
         let app = app.clone();
         let done = Arc::clone(&done);
         let okc = Arc::clone(&okc);
-        handles.push(tauri::async_runtime::spawn_blocking(move || {
-            let dir = Path::new(&p);
-            // 无改动则跳过，避免 "No local changes to save"
-            let r = match run_git(dir, &["status", "--porcelain"]) {
-                Ok(s) if s.trim().is_empty() => OpResult {
-                    path: p,
-                    ok: true,
-                    message: "无改动，跳过".to_string(),
-                },
-                _ => {
-                    let msg = if label.trim().is_empty() {
-                        "RepoPilot stash".to_string()
-                    } else {
-                        label.trim().to_string()
-                    };
-                    let args: Vec<String> = if include_untracked {
-                        vec!["stash".into(), "push".into(), "-u".into(), "-m".into(), msg]
-                    } else {
-                        vec!["stash".into(), "push".into(), "-m".into(), msg]
-                    };
-                    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                    match run_git_timeout(dir, &arg_refs, 60).map_err(|e| friendly_git_err(&e)) {
-                        Ok(out) => OpResult {
-                            path: p,
-                            ok: true,
-                            message: if out.is_empty() { "已暂存改动".to_string() } else { out },
-                        },
-                        Err(e) => OpResult {
-                            path: p,
-                            ok: false,
-                            message: e,
-                        },
+        let sem = Arc::clone(&sem);
+        handles.push(tauri::async_runtime::spawn(async move {
+            let _perm = sem.acquire().await.expect("semaphore closed");
+            tauri::async_runtime::spawn_blocking(move || {
+                let dir = Path::new(&p);
+                // 无改动则跳过，避免 "No local changes to save"
+                let r = match run_git(dir, &["status", "--porcelain"]) {
+                    Ok(s) if s.trim().is_empty() => OpResult {
+                        path: p,
+                        ok: true,
+                        message: "无改动，跳过".to_string(),
+                    },
+                    _ => {
+                        let msg = if label.trim().is_empty() {
+                            "RepoPilot stash".to_string()
+                        } else {
+                            label.trim().to_string()
+                        };
+                        let args: Vec<String> = if include_untracked {
+                            vec!["stash".into(), "push".into(), "-u".into(), "-m".into(), msg]
+                        } else {
+                            vec!["stash".into(), "push".into(), "-m".into(), msg]
+                        };
+                        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                        match run_git_timeout(dir, &arg_refs, 60).map_err(|e| friendly_git_err(&e)) {
+                            Ok(out) => OpResult {
+                                path: p,
+                                ok: true,
+                                message: if out.is_empty() { "已暂存改动".to_string() } else { out },
+                            },
+                            Err(e) => OpResult {
+                                path: p,
+                                ok: false,
+                                message: e,
+                            },
+                        }
                     }
+                };
+                if r.ok {
+                    okc.fetch_add(1, Ordering::SeqCst);
                 }
-            };
-            if r.ok {
-                okc.fetch_add(1, Ordering::SeqCst);
-            }
-            let d = done.fetch_add(1, Ordering::SeqCst) + 1;
-            let _ = app.emit(
-                "repopilot-progress",
-                BatchProgress {
-                    done: d,
-                    total,
-                    ok: okc.load(Ordering::SeqCst),
-                    path: r.path.clone(),
-                },
-            );
-            r
+                let d = done.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = app.emit(
+                    "repopilot-progress",
+                    BatchProgress {
+                        done: d,
+                        total,
+                        ok: okc.load(Ordering::SeqCst),
+                        path: r.path.clone(),
+                    },
+                );
+                r
+            })
+            .await
+            .unwrap_or_else(|_| OpResult {
+                path: "未知".to_string(),
+                ok: false,
+                message: "后台任务失败".to_string(),
+            })
         }));
     }
     let mut results = Vec::with_capacity(handles.len());
@@ -416,48 +504,59 @@ async fn stash_pop_repos(app: tauri::AppHandle, paths: Vec<String>) -> Vec<OpRes
     let total = paths.len() as i32;
     let done = Arc::new(AtomicI32::new(0));
     let okc = Arc::new(AtomicI32::new(0));
+    let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let mut handles = Vec::new();
     for p in &paths {
         let p = p.clone();
         let app = app.clone();
         let done = Arc::clone(&done);
         let okc = Arc::clone(&okc);
-        handles.push(tauri::async_runtime::spawn_blocking(move || {
-            let dir = Path::new(&p);
-            // 无 stash 则跳过
-            let r = match run_git(dir, &["stash", "list"]) {
-                Ok(s) if s.trim().is_empty() => OpResult {
-                    path: p,
-                    ok: true,
-                    message: "无 stash，跳过".to_string(),
-                },
-                _ => match run_git_timeout(dir, &["stash", "pop"], 60).map_err(|e| friendly_git_err(&e)) {
-                    Ok(out) => OpResult {
+        let sem = Arc::clone(&sem);
+        handles.push(tauri::async_runtime::spawn(async move {
+            let _perm = sem.acquire().await.expect("semaphore closed");
+            tauri::async_runtime::spawn_blocking(move || {
+                let dir = Path::new(&p);
+                // 无 stash 则跳过
+                let r = match run_git(dir, &["stash", "list"]) {
+                    Ok(s) if s.trim().is_empty() => OpResult {
                         path: p,
                         ok: true,
-                        message: if out.is_empty() { "已恢复改动".to_string() } else { out },
+                        message: "无 stash，跳过".to_string(),
                     },
-                    Err(e) => OpResult {
-                        path: p,
-                        ok: false,
-                        message: e,
+                    _ => match run_git_timeout(dir, &["stash", "pop"], 60).map_err(|e| friendly_git_err(&e)) {
+                        Ok(out) => OpResult {
+                            path: p,
+                            ok: true,
+                            message: if out.is_empty() { "已恢复改动".to_string() } else { out },
+                        },
+                        Err(e) => OpResult {
+                            path: p,
+                            ok: false,
+                            message: e,
+                        },
                     },
-                },
-            };
-            if r.ok {
-                okc.fetch_add(1, Ordering::SeqCst);
-            }
-            let d = done.fetch_add(1, Ordering::SeqCst) + 1;
-            let _ = app.emit(
-                "repopilot-progress",
-                BatchProgress {
-                    done: d,
-                    total,
-                    ok: okc.load(Ordering::SeqCst),
-                    path: r.path.clone(),
-                },
-            );
-            r
+                };
+                if r.ok {
+                    okc.fetch_add(1, Ordering::SeqCst);
+                }
+                let d = done.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = app.emit(
+                    "repopilot-progress",
+                    BatchProgress {
+                        done: d,
+                        total,
+                        ok: okc.load(Ordering::SeqCst),
+                        path: r.path.clone(),
+                    },
+                );
+                r
+            })
+            .await
+            .unwrap_or_else(|_| OpResult {
+                path: "未知".to_string(),
+                ok: false,
+                message: "后台任务失败".to_string(),
+            })
         }));
     }
     let mut results = Vec::with_capacity(handles.len());
@@ -511,6 +610,7 @@ async fn run_command(app: tauri::AppHandle, paths: Vec<String>, command: String)
     let total = paths.len() as i32;
     let done = Arc::new(AtomicI32::new(0));
     let okc = Arc::new(AtomicI32::new(0));
+    let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let mut handles = Vec::new();
     for p in &paths {
         let p = p.clone();
@@ -518,75 +618,68 @@ async fn run_command(app: tauri::AppHandle, paths: Vec<String>, command: String)
         let app = app.clone();
         let done = Arc::clone(&done);
         let okc = Arc::clone(&okc);
-        handles.push(tauri::async_runtime::spawn_blocking(move || {
-            // 在仓库目录执行用户自定义命令（sh -c；命令由用户本人输入，等同在终端手动执行）
-            // 用线程 + 超时避免交互式命令挂起，stdin 置空
-            let (tx, rx) = std::sync::mpsc::channel();
-            let p_c = p.clone();
-            let cmd_c = cmd.clone();
-            std::thread::spawn(move || {
-                let out = Command::new("sh")
-                    .arg("-c")
-                    .arg(&cmd_c)
-                    .current_dir(&p_c)
-                    .stdin(std::process::Stdio::null())
-                    .output();
-                let _ = tx.send(out);
-            });
-            let out = rx.recv_timeout(std::time::Duration::from_secs(120));
-            let r = match out {
-                Ok(Ok(o)) => {
-                    let out_txt = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    let err_txt = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                    if o.status.success() {
-                        let msg = if out_txt.is_empty() {
-                            "命令执行成功".to_string()
+        let sem = Arc::clone(&sem);
+        handles.push(tauri::async_runtime::spawn(async move {
+            let _perm = sem.acquire().await.expect("semaphore closed");
+            tauri::async_runtime::spawn_blocking(move || {
+                // 在仓库目录执行用户自定义命令（sh -c；命令由用户本人输入，等同在终端手动执行）
+                // 带超时并 kill 挂起的命令进程，stdin 置空避免交互式挂起
+                let out = run_shell_timeout(&cmd, Path::new(&p), 120);
+                let r = match out {
+                    Ok(o) => {
+                        let out_txt = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        let err_txt = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                        if o.status.success() {
+                            let msg = if out_txt.is_empty() {
+                                "命令执行成功".to_string()
+                            } else {
+                                out_txt
+                            };
+                            OpResult {
+                                path: p,
+                                ok: true,
+                                message: msg,
+                            }
                         } else {
-                            out_txt
-                        };
-                        OpResult {
-                            path: p,
-                            ok: true,
-                            message: msg,
-                        }
-                    } else {
-                        let msg = if err_txt.is_empty() {
-                            "命令执行失败".to_string()
-                        } else {
-                            friendly_git_err(&err_txt)
-                        };
-                        OpResult {
-                            path: p,
-                            ok: false,
-                            message: msg,
+                            let msg = if err_txt.is_empty() {
+                                "命令执行失败".to_string()
+                            } else {
+                                friendly_git_err(&err_txt)
+                            };
+                            OpResult {
+                                path: p,
+                                ok: false,
+                                message: msg,
+                            }
                         }
                     }
+                    Err(e) => OpResult {
+                        path: p,
+                        ok: false,
+                        message: e,
+                    },
+                };
+                if r.ok {
+                    okc.fetch_add(1, Ordering::SeqCst);
                 }
-                Ok(Err(e)) => OpResult {
-                    path: p,
-                    ok: false,
-                    message: format!("无法执行命令：{e}"),
-                },
-                Err(_) => OpResult {
-                    path: p,
-                    ok: false,
-                    message: "命令执行超时（可能等待输入），已中止".to_string(),
-                },
-            };
-            if r.ok {
-                okc.fetch_add(1, Ordering::SeqCst);
-            }
-            let d = done.fetch_add(1, Ordering::SeqCst) + 1;
-            let _ = app.emit(
-                "repopilot-progress",
-                BatchProgress {
-                    done: d,
-                    total,
-                    ok: okc.load(Ordering::SeqCst),
-                    path: r.path.clone(),
-                },
-            );
-            r
+                let d = done.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = app.emit(
+                    "repopilot-progress",
+                    BatchProgress {
+                        done: d,
+                        total,
+                        ok: okc.load(Ordering::SeqCst),
+                        path: r.path.clone(),
+                    },
+                );
+                r
+            })
+            .await
+            .unwrap_or_else(|_| OpResult {
+                path: "未知".to_string(),
+                ok: false,
+                message: "后台任务失败".to_string(),
+            })
         }));
     }
     let mut results = Vec::with_capacity(handles.len());
@@ -634,6 +727,7 @@ async fn replace_remotes(app: tauri::AppHandle, paths: Vec<String>, old: String,
     let total = paths.len() as i32;
     let done = Arc::new(AtomicI32::new(0));
     let okc = Arc::new(AtomicI32::new(0));
+    let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let mut handles = Vec::new();
     for p in &paths {
         let p = p.clone();
@@ -642,61 +736,71 @@ async fn replace_remotes(app: tauri::AppHandle, paths: Vec<String>, old: String,
         let app = app.clone();
         let done = Arc::clone(&done);
         let okc = Arc::clone(&okc);
-        handles.push(tauri::async_runtime::spawn_blocking(move || {
-            let dir = Path::new(&p);
-            let r = match run_git(dir, &["remote", "get-url", "origin"]) {
-                Ok(u) => {
-                    if !u.contains(&old) {
-                        OpResult {
-                            path: p,
-                            ok: false,
-                            message: format!("地址不含旧串，跳过：{u}"),
-                        }
-                    } else {
-                        let new_url = u.replace(&old, &new);
-                        match run_git(dir, &["remote", "set-url", "origin", &new_url]) {
-                            Ok(_) => {
-                                let mut msg = format!("{u}  →  {new_url}");
-                                // 同步更新 .gitmodules（如有）
-                                match update_gitmodules(dir, &old, &new) {
-                                    Ok(true) => msg.push_str("；已同步更新 .gitmodules"),
-                                    Ok(false) => {}
-                                    Err(e) => msg.push_str(&format!("；警告：{e}")),
-                                }
-                                OpResult {
-                                    path: p,
-                                    ok: true,
-                                    message: msg,
-                                }
-                            }
-                            Err(e) => OpResult {
+        let sem = Arc::clone(&sem);
+        handles.push(tauri::async_runtime::spawn(async move {
+            let _perm = sem.acquire().await.expect("semaphore closed");
+            tauri::async_runtime::spawn_blocking(move || {
+                let dir = Path::new(&p);
+                let r = match run_git(dir, &["remote", "get-url", "origin"]) {
+                    Ok(u) => {
+                        if !u.contains(&old) {
+                            OpResult {
                                 path: p,
                                 ok: false,
-                                message: e,
-                            },
+                                message: format!("地址不含旧串，跳过：{u}"),
+                            }
+                        } else {
+                            let new_url = u.replace(&old, &new);
+                            match run_git(dir, &["remote", "set-url", "origin", &new_url]) {
+                                Ok(_) => {
+                                    let mut msg = format!("{u}  →  {new_url}");
+                                    // 同步更新 .gitmodules（如有）
+                                    match update_gitmodules(dir, &old, &new) {
+                                        Ok(true) => msg.push_str("；已同步更新 .gitmodules"),
+                                        Ok(false) => {}
+                                        Err(e) => msg.push_str(&format!("；警告：{e}")),
+                                    }
+                                    OpResult {
+                                        path: p,
+                                        ok: true,
+                                        message: msg,
+                                    }
+                                }
+                                Err(e) => OpResult {
+                                    path: p,
+                                    ok: false,
+                                    message: e,
+                                },
+                            }
                         }
                     }
+                    Err(e) => OpResult {
+                        path: p,
+                        ok: false,
+                        message: format!("读取 remote 失败：{e}"),
+                    },
+                };
+                if r.ok {
+                    okc.fetch_add(1, Ordering::SeqCst);
                 }
-                Err(e) => OpResult {
-                    path: p,
-                    ok: false,
-                    message: format!("读取 remote 失败：{e}"),
-                },
-            };
-            if r.ok {
-                okc.fetch_add(1, Ordering::SeqCst);
-            }
-            let d = done.fetch_add(1, Ordering::SeqCst) + 1;
-            let _ = app.emit(
-                "repopilot-progress",
-                BatchProgress {
-                    done: d,
-                    total,
-                    ok: okc.load(Ordering::SeqCst),
-                    path: r.path.clone(),
-                },
-            );
-            r
+                let d = done.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = app.emit(
+                    "repopilot-progress",
+                    BatchProgress {
+                        done: d,
+                        total,
+                        ok: okc.load(Ordering::SeqCst),
+                        path: r.path.clone(),
+                    },
+                );
+                r
+            })
+            .await
+            .unwrap_or_else(|_| OpResult {
+                path: "未知".to_string(),
+                ok: false,
+                message: "后台任务失败".to_string(),
+            })
         }));
     }
     let mut results = Vec::with_capacity(handles.len());
@@ -748,7 +852,7 @@ fn commit_files(path: String, files: Vec<String>, message: String) -> Result<OpR
     if files.is_empty() {
         return Err("请选择要提交的文件".to_string());
     }
-    let mut add_args = vec!["add"];
+    let mut add_args = vec!["add", "--"]; // "--" 防止以 - 开头的文件名被 git 当作选项
     for f in &files {
         add_args.push(f.as_str());
     }
@@ -983,6 +1087,7 @@ async fn switch_branches(app: tauri::AppHandle, paths: Vec<String>, branch: Stri
     let total = paths.len() as i32;
     let done = Arc::new(AtomicI32::new(0));
     let okc = Arc::new(AtomicI32::new(0));
+    let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let mut handles = Vec::new();
     for p in &paths {
         let p = p.clone();
@@ -990,34 +1095,44 @@ async fn switch_branches(app: tauri::AppHandle, paths: Vec<String>, branch: Stri
         let app = app.clone();
         let done = Arc::clone(&done);
         let okc = Arc::clone(&okc);
-        handles.push(tauri::async_runtime::spawn_blocking(move || {
-            let dir = Path::new(&p);
-            let r = match run_git(dir, &["switch", &branch]) {
-                Ok(_) => OpResult {
-                    path: p,
-                    ok: true,
-                    message: format!("已切换到分支 {branch}"),
-                },
-                Err(e) => OpResult {
-                    path: p,
-                    ok: false,
-                    message: e,
-                },
-            };
-            if r.ok {
-                okc.fetch_add(1, Ordering::SeqCst);
-            }
-            let d = done.fetch_add(1, Ordering::SeqCst) + 1;
-            let _ = app.emit(
-                "repopilot-progress",
-                BatchProgress {
-                    done: d,
-                    total,
-                    ok: okc.load(Ordering::SeqCst),
-                    path: r.path.clone(),
-                },
-            );
-            r
+        let sem = Arc::clone(&sem);
+        handles.push(tauri::async_runtime::spawn(async move {
+            let _perm = sem.acquire().await.expect("semaphore closed");
+            tauri::async_runtime::spawn_blocking(move || {
+                let dir = Path::new(&p);
+                let r = match run_git(dir, &["switch", &branch]) {
+                    Ok(_) => OpResult {
+                        path: p,
+                        ok: true,
+                        message: format!("已切换到分支 {branch}"),
+                    },
+                    Err(e) => OpResult {
+                        path: p,
+                        ok: false,
+                        message: e,
+                    },
+                };
+                if r.ok {
+                    okc.fetch_add(1, Ordering::SeqCst);
+                }
+                let d = done.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = app.emit(
+                    "repopilot-progress",
+                    BatchProgress {
+                        done: d,
+                        total,
+                        ok: okc.load(Ordering::SeqCst),
+                        path: r.path.clone(),
+                    },
+                );
+                r
+            })
+            .await
+            .unwrap_or_else(|_| OpResult {
+                path: "未知".to_string(),
+                ok: false,
+                message: "后台任务失败".to_string(),
+            })
         }));
     }
     let mut results = Vec::with_capacity(handles.len());
