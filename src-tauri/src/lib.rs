@@ -307,7 +307,7 @@ async fn pull_repos(app: tauri::AppHandle, paths: Vec<String>) -> Vec<OpResult> 
             let _perm = sem.acquire().await.expect("semaphore closed");
             tauri::async_runtime::spawn_blocking(move || {
                 let dir = Path::new(&p);
-                let r = match run_git_timeout(dir, &["pull"], 60) {
+                let r = match run_git_timeout(dir, &["pull", "--no-rebase"], 60) {
                     Ok(_) => OpResult {
                         path: p,
                         ok: true,
