@@ -96,7 +96,7 @@ const appVersion = ref("0.1.0");
 const commitModal = ref<CommitModal | null>(null);
 const cloneModal = ref<{ url: string; base: string; busy: boolean } | null>(null);
 const logModal = ref<LogModal | null>(null);
-const changesTip = ref<{ path: string; files: ChangeFile[]; x: number; y: number } | null>(null);
+const changesTip = ref<{ path: string; files: ChangeFile[]; x: number; y: number; err?: string } | null>(null);
 const changesCache = new Map<string, ChangeFile[]>();
 const progress = ref<{ done: number; total: number; ok: number; path: string } | null>(null);
 const batchSummary = ref<{ ok: number; fail: number } | null>(null);
@@ -564,6 +564,8 @@ const isTauri = computed(
 );
 
 let timer: number | undefined;
+// 防止自动刷新在上一轮未结束时又触发一轮（并发刷新导致旧结果覆盖新结果）
+let refreshing = false;
 
 type SortKey =
   | "name"
@@ -905,8 +907,10 @@ const visibleRows = computed<Row[]>(() => {
       emitted.add(k.path);
       const isContainer = containerSet.has(k.path);
       const hasCh = !!allChildren.get(k.path)?.length;
-      // 容器行始终展开（否则命中的孙仓库不可见）
-      const isExp = expanded.value.has(k.path) || isContainer;
+      // 容器行默认展开，但可用 expanded 集合记录"已折叠"（语义与普通行相反）
+      const isExp = isContainer
+        ? !expanded.value.has(k.path)
+        : expanded.value.has(k.path);
       idx += 1;
       const seq = `${prefix}.${idx}`;
       rows.push({
@@ -944,7 +948,14 @@ const visibleRows = computed<Row[]>(() => {
     const hasCh = !!allChildren.get(c)?.length;
     top += 1;
     const seq = String(top);
-    rows.push({ r: cr, depth: 0, hasChildren: hasCh, expanded: true, seq, container: true });
+    rows.push({
+      r: cr,
+      depth: 0,
+      hasChildren: hasCh,
+      expanded: !expanded.value.has(c), // 容器行默认展开，可折叠
+      seq,
+      container: true,
+    });
     if (hasCh) emitChildren(c, 1, seq);
   }
   return rows;
@@ -1246,6 +1257,17 @@ function hideChangesDelayed() {
     changesTip.value = null;
   }, 250);
 }
+// 悬停查看错误状态的具体原因
+function showErrTip(e: MouseEvent, r: RepoStatus) {
+  if (hideTipTimer) {
+    clearTimeout(hideTipTimer);
+    hideTipTimer = undefined;
+  }
+  const pad = 14;
+  const x = Math.min(e.clientX + pad, window.innerWidth - 440);
+  const y = Math.min(e.clientY + pad, window.innerHeight - 260);
+  changesTip.value = { path: r.path, files: [], err: r.error ?? "", x, y };
+}
 function keepChanges() {
   if (hideTipTimer) {
     clearTimeout(hideTipTimer);
@@ -1348,6 +1370,8 @@ async function scan() {
       }
     }
     repos.value = [...all.values()];
+    // 仓库集合已变化，旧的改动文件缓存作废
+    changesCache.clear();
     // 默认不勾选任何仓库，需要操作时用「全选当前」或手动勾选（安全优先）
     selected.value = new Set();
     // 记住本次目录，下次打开自动恢复
@@ -1462,6 +1486,8 @@ async function refreshStatus(silent = false) {
   const statuses: RepoStatus[] = await invoke("get_statuses", { paths });
   for (const s of statuses) s.parent = oldParent.get(s.path) ?? null;
   repos.value = statuses;
+  // 状态已变化，改动文件缓存作废（下次悬停重新拉取）
+  changesCache.clear();
   lastRefresh.value = new Date().toLocaleTimeString();
   void updateBadge();
   if (!silent) addLog(t("logRefreshed"));
@@ -1479,7 +1505,14 @@ watch(autoRefresh, (on) => {
       countdown.value--;
       if (countdown.value <= 0) {
         countdown.value = 30;
-        if (repos.value.length) refreshStatus(true);
+        if (repos.value.length && !refreshing) {
+          refreshing = true;
+          refreshStatus(true)
+            .catch(() => {})
+            .finally(() => {
+              refreshing = false;
+            });
+        }
       }
     }, 1000);
     addLog(t("logAutoOn"));
@@ -1918,7 +1951,12 @@ async function replaceRemote() {
               </td>
               <td>{{ row.r.branch || "—" }}</td>
               <td>
-                <span v-if="row.r.error" class="badge err">{{ t("bErr") }}</span>
+                <span
+                  v-if="row.r.error"
+                  class="badge err tipable"
+                  @mouseenter="showErrTip($event, row.r)"
+                  @mouseleave="hideChangesDelayed"
+                >{{ t("bErr") }}</span>
                 <span
                   v-else-if="row.r.dirty"
                   class="badge dirty tipable"
@@ -2088,8 +2126,11 @@ async function replaceRemote() {
     </div>
 
     <div v-if="changesTip" class="changes-tip" :style="{ left: changesTip.x + 'px', top: changesTip.y + 'px' }" @mouseenter="keepChanges" @mouseleave="hideChangesDelayed">
-      <div class="ct-title">{{ changesTip.path.split("/").pop() }} · {{ changesTip.files.length }}</div>
-      <div class="ct-list">
+      <div class="ct-title">{{ changesTip.path.split("/").pop() }}<template v-if="changesTip.err !== undefined"> · {{ t("bErr") }}</template><template v-else> · {{ changesTip.files.length }}</template></div>
+      <div v-if="changesTip.err !== undefined" class="ct-list">
+        <div class="ct-err">{{ changesTip.err }}</div>
+      </div>
+      <div v-else class="ct-list">
         <div v-if="!changesTip.files.length" class="hint">{{ t("commitNoChanges") }}</div>
         <div v-for="(f, i) in changesTip.files" :key="i" class="ct-file">
           <span class="cst" :class="{ unt: f.status.trim() === '??' }">{{ statusLabel(f.status) }}</span>
@@ -2471,6 +2512,8 @@ html.dark .log-list .la { color: #8b949e; }
 .changes-tip .ct-list { max-height: 220px; overflow: auto; display: flex; flex-direction: column; gap: 3px; }
 .changes-tip .ct-file { display: flex; align-items: flex-start; gap: 6px; }
 .changes-tip .ct-file .cp { white-space: normal; word-break: break-all; line-height: 1.4; }
+.changes-tip .ct-err { color: #cf222e; white-space: normal; word-break: break-all; line-height: 1.5; padding: 2px 0; }
+html.dark .changes-tip .ct-err { color: #ff7b72; }
 html.dark .changes-tip { background: #1c2128; border-color: #30363d; box-shadow: 0 6px 20px #000a; }
 html.dark .changes-tip .ct-title { color: #e6edf3; }
 html.dark .commit-list { border-color: #30363d; }
