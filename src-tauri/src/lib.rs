@@ -169,9 +169,14 @@ fn scan_repos(root: String) -> Vec<RepoEntry> {
 
 fn parse_count(s: &str, key: &str) -> i32 {
     // 从 "[ahead 1, behind 2]" 之类的括号中取数字
+    // 注意：key 之后可能是 " 1"（前导空格），需先跳过非数字字符再取连续数字
     if let Some(idx) = s.find(key) {
         let rest = &s[idx + key.len()..];
-        let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let num: String = rest
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
         return num.parse().unwrap_or(0);
     }
     0
@@ -926,30 +931,46 @@ fn load_groups(app: tauri::AppHandle) -> Result<GroupState, String> {
     Ok(GroupState::default())
 }
 
-/// 列出仓库的可用分支（本地 + 远程名去重，去掉 origin/HEAD，远程分支简化为分支名）
+/// 列出仓库的可用分支（本地 + 远程名去重，去掉 origin/HEAD）
+/// 注意：本地分支名可能含斜杠（如 feature/login），必须保留完整短名，不能按 '/' 截断；
+/// 仅远程分支（origin/xxx）才去掉 remote 前缀。
 #[tauri::command]
 fn list_branches(path: String) -> Vec<String> {
     let dir = Path::new(&path);
-    let Ok(raw) = run_git(
-        dir,
-        &["for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes"],
-    ) else {
-        return Vec::new();
-    };
     let mut seen = std::collections::HashSet::new();
     let mut out: Vec<String> = Vec::new();
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.ends_with("/HEAD") {
-            continue;
+    // 本地分支：短名即完整分支名（本地优先）
+    if let Ok(raw) = run_git(
+        dir,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+    ) {
+        for line in raw.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if seen.insert(line.to_string()) {
+                out.push(line.to_string());
+            }
         }
-        // 远程分支 origin/dev → dev；本地分支 dev 直接保留（本地优先，先输出本地再输出远程）
-        let short = match line.find('/') {
-            Some(idx) => line[idx + 1..].to_string(),
-            None => line.to_string(),
-        };
-        if seen.insert(short.clone()) {
-            out.push(short);
+    }
+    // 远程分支：origin/dev → dev；origin/feature/foo → feature/foo（只去掉 remote 前缀）
+    if let Ok(raw) = run_git(
+        dir,
+        &["for-each-ref", "--format=%(refname:short)", "refs/remotes"],
+    ) {
+        for line in raw.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.ends_with("/HEAD") {
+                continue;
+            }
+            let short = match line.find('/') {
+                Some(idx) => line[idx + 1..].to_string(),
+                None => line.to_string(),
+            };
+            if seen.insert(short.clone()) {
+                out.push(short);
+            }
         }
     }
     out.sort();
@@ -1119,6 +1140,73 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let changed = update_gitmodules(&dir, "old", "new").unwrap();
         assert!(!changed, "无 .gitmodules 时应返回 false");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_count_ahead_behind() {
+        // git status --porcelain=v1 -b 的典型分支行：## main...origin/main [ahead 1, behind 2]
+        let bracket = "[ahead 1, behind 2]";
+        assert_eq!(parse_count(bracket, "ahead"), 1, "ahead 应解析为 1");
+        assert_eq!(parse_count(bracket, "behind"), 2, "behind 应解析为 2");
+        // 只有 ahead
+        assert_eq!(parse_count("[ahead 3]", "ahead"), 3);
+        assert_eq!(parse_count("[ahead 3]", "behind"), 0);
+        // 不含关键词
+        assert_eq!(parse_count("[gone]", "ahead"), 0);
+    }
+
+    #[test]
+    fn test_parse_count_branch_line() {
+        // 直接喂 get_one_status 中使用的完整 bracket（rest.find('[') 之后的片段）
+        let rest = "main...origin/main [ahead 12, behind 3]";
+        if let Some(idx) = rest.find('[') {
+            let bracket = &rest[idx..];
+            assert_eq!(parse_count(bracket, "ahead"), 12);
+            assert_eq!(parse_count(bracket, "behind"), 3);
+        } else {
+            panic!("未找到 [");
+        }
+    }
+
+    #[test]
+    fn test_list_branches_keeps_slash_in_local_branch() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join("repopilot_branch_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let init = Command::new("git")
+            .arg("-C").arg(&dir).arg("init").arg("-b").arg("main")
+            .output().unwrap();
+        assert!(init.status.success(), "git init 失败");
+        let _ = Command::new("git")
+            .arg("-C").arg(&dir).arg("config").arg("user.email").arg("t@t")
+            .output().unwrap();
+        let _ = Command::new("git")
+            .arg("-C").arg(&dir).arg("config").arg("user.name").arg("t")
+            .output().unwrap();
+        fs::write(dir.join("a.txt"), "x").unwrap();
+        let _ = Command::new("git").arg("-C").arg(&dir).arg("add").arg(".").output().unwrap();
+        let commit = Command::new("git")
+            .arg("-C").arg(&dir).arg("commit").arg("-m").arg("init")
+            .output().unwrap();
+        assert!(commit.status.success(), "git commit 失败: {}", String::from_utf8_lossy(&commit.stderr));
+        // 创建一个含斜杠的本地分支（feature/login），这是本 bug 的复现点
+        let br = Command::new("git")
+            .arg("-C").arg(&dir).arg("branch").arg("feature/login")
+            .output().unwrap();
+        assert!(br.status.success(), "创建 feature/login 失败");
+
+        let branches = list_branches(dir.to_string_lossy().to_string());
+        assert!(
+            branches.iter().any(|b| b == "feature/login"),
+            "含斜杠的本地分支名被截断，实际返回: {branches:?}"
+        );
+        assert!(
+            !branches.iter().any(|b| b == "login"),
+            "不应出现被截断的分支名 login，实际返回: {branches:?}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
