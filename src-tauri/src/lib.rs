@@ -146,8 +146,20 @@ fn check_remote_conflicts(
     }
 }
 
+/// 构造 git 命令：Windows 下必须隐藏控制台窗口——
+/// GUI 进程启动 git.exe（控制台程序）时若不设 CREATE_NO_WINDOW，每个 git 进程都会弹一个黑框窗口。
+fn new_git_cmd() -> Command {
+    let mut c = Command::new("git");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    c
+}
+
 fn run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
+    let out = new_git_cmd()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -166,7 +178,7 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
 /// 带超时的 git 调用（用于批量写操作）：stdin 置空避免交互式认证挂起。
 /// 超时会真正 kill 掉 git 子进程并返回明确错误，避免残留挂死的进程堆积。
 fn run_git_timeout(dir: &Path, args: &[&str], secs: u64) -> Result<String, String> {
-    let mut child = Command::new("git")
+    let mut child = new_git_cmd()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -233,7 +245,7 @@ fn run_git_auth_impl(
     password: &str,
     secs: u64,
 ) -> Result<String, String> {
-    let mut child = Command::new("git")
+    let mut child = new_git_cmd()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -296,7 +308,7 @@ fn approve_credentials(url: &str, username: &str, password: &str) {
         "protocol={protocol}\nhost={host}\nusername={username}\npassword={password}\n\n"
     );
     use std::io::Write;
-    if let Ok(mut child) = Command::new("git")
+    if let Ok(mut child) = new_git_cmd()
         .arg("-c")
         .arg("credential.helper=osxkeychain")
         .args(["credential", "approve"])
@@ -311,7 +323,7 @@ fn approve_credentials(url: &str, username: &str, password: &str) {
         let _ = child.wait();
     }
     // 启用全局 helper，后续 pull/push 自动从钥匙串取凭据
-    let _ = Command::new("git")
+    let _ = new_git_cmd()
         .args(["config", "--global", "credential.helper", "osxkeychain"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -354,7 +366,7 @@ fn run_git_auth(
 /// 向 git 标准输入写入内容执行（用于 git apply --cached 从 stdin 应用补丁）
 fn run_git_stdin(dir: &Path, args: &[&str], input: &str) -> Result<String, String> {
     use std::io::Write;
-    let mut child = Command::new("git")
+    let mut child = new_git_cmd()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -377,8 +389,23 @@ fn run_git_stdin(dir: &Path, args: &[&str], input: &str) -> Result<String, Strin
     }
 }
 
-/// 带超时执行 shell 命令（sh -c）：超时 kill 掉命令进程，避免交互式命令残留挂起
+/// 带超时执行 shell 命令（mac/linux: sh -c；windows: cmd /C）：超时 kill 掉命令进程，避免交互式命令残留挂起
 fn run_shell_timeout(cmd: &str, dir: &Path, secs: u64) -> Result<std::process::Output, String> {
+    #[cfg(windows)]
+    let mut child = {
+        use std::os::windows::process::CommandExt;
+        Command::new("cmd")
+            .arg("/C")
+            .arg(cmd)
+            .current_dir(dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .spawn()
+            .map_err(|e| format!("无法执行命令：{e}"))?
+    };
+    #[cfg(not(windows))]
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(cmd)
@@ -2170,15 +2197,26 @@ fn stash_drop(path: String, index: String) -> Result<OpResult, String> {
     })
 }
 
-/// 在指定目录打开 macOS 终端
+/// 在仓库目录打开终端（mac: Terminal；windows: 新开 cmd 窗口）
 #[tauri::command]
 fn open_terminal(path: String) -> Result<(), String> {
+    #[cfg(not(windows))]
     let out = Command::new("open")
         .arg("-a")
         .arg("Terminal")
         .arg(&path)
         .output()
         .map_err(|e| format!("无法打开终端：{e}"))?;
+    #[cfg(windows)]
+    let out = {
+        use std::os::windows::process::CommandExt;
+        Command::new("cmd")
+            .args(["/C", "start", "", "cmd"])
+            .current_dir(&path)
+            .creation_flags(0x0800_0000)
+            .output()
+            .map_err(|e| format!("无法打开终端：{e}"))?
+    };
     if out.status.success() {
         Ok(())
     } else {
@@ -2191,15 +2229,21 @@ fn open_terminal(path: String) -> Result<(), String> {
     }
 }
 
-// 用系统文本编辑器打开仓库的 .git/config（TextEdit）
+// 用系统文本编辑器打开仓库的 .git/config（mac: TextEdit；windows: 记事本）
 #[tauri::command]
 fn open_git_config(path: String) -> Result<(), String> {
     let cfg = std::path::Path::new(&path).join(".git").join("config");
     if !cfg.exists() {
         return Err("未找到 .git/config".to_string());
     }
+    #[cfg(not(windows))]
     let out = Command::new("open")
         .arg("-e")
+        .arg(&cfg)
+        .output()
+        .map_err(|e| format!("无法打开配置文件：{e}"))?;
+    #[cfg(windows)]
+    let out = Command::new("notepad")
         .arg(&cfg)
         .output()
         .map_err(|e| format!("无法打开配置文件：{e}"))?;
@@ -2397,24 +2441,24 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let init = Command::new("git")
+        let init = new_git_cmd()
             .arg("-C").arg(&dir).arg("init").arg("-b").arg("main")
             .output().unwrap();
         assert!(init.status.success(), "git init 失败");
-        let _ = Command::new("git")
+        let _ = new_git_cmd()
             .arg("-C").arg(&dir).arg("config").arg("user.email").arg("t@t")
             .output().unwrap();
-        let _ = Command::new("git")
+        let _ = new_git_cmd()
             .arg("-C").arg(&dir).arg("config").arg("user.name").arg("t")
             .output().unwrap();
         fs::write(dir.join("a.txt"), "x").unwrap();
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("add").arg(".").output().unwrap();
-        let commit = Command::new("git")
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("add").arg(".").output().unwrap();
+        let commit = new_git_cmd()
             .arg("-C").arg(&dir).arg("commit").arg("-m").arg("init")
             .output().unwrap();
         assert!(commit.status.success(), "git commit 失败: {}", String::from_utf8_lossy(&commit.stderr));
         // 创建一个含斜杠的本地分支（feature/login），这是本 bug 的复现点
-        let br = Command::new("git")
+        let br = new_git_cmd()
             .arg("-C").arg(&dir).arg("branch").arg("feature/login")
             .output().unwrap();
         assert!(br.status.success(), "创建 feature/login 失败");
@@ -2438,19 +2482,19 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let init = Command::new("git")
+        let init = new_git_cmd()
             .arg("-C").arg(&dir).arg("init").arg("-b").arg("main")
             .output().unwrap();
         assert!(init.status.success(), "git init 失败");
-        let _ = Command::new("git")
+        let _ = new_git_cmd()
             .arg("-C").arg(&dir).arg("config").arg("user.email").arg("t@t")
             .output().unwrap();
-        let _ = Command::new("git")
+        let _ = new_git_cmd()
             .arg("-C").arg(&dir).arg("config").arg("user.name").arg("t")
             .output().unwrap();
         fs::write(dir.join("a.txt"), "1").unwrap();
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("add").arg(".").output().unwrap();
-        let _ = Command::new("git")
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("add").arg(".").output().unwrap();
+        let _ = new_git_cmd()
             .arg("-C").arg(&dir).arg("commit").arg("-m").arg("init")
             .output().unwrap();
         // 先提交 src/App.vue，再未暂存修改它：porcelain 输出 " M src/App.vue"（行首空格），
@@ -2458,8 +2502,8 @@ mod tests {
         let sub = dir.join("src");
         fs::create_dir_all(&sub).unwrap();
         fs::write(sub.join("App.vue"), "v1").unwrap();
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("add").arg(".").output().unwrap();
-        let _ = Command::new("git")
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("add").arg(".").output().unwrap();
+        let _ = new_git_cmd()
             .arg("-C").arg(&dir).arg("commit").arg("-m").arg("init2")
             .output().unwrap();
         fs::write(sub.join("App.vue"), "v2").unwrap();
@@ -2479,15 +2523,15 @@ mod tests {
         let dir = std::env::temp_dir().join("repopilot_hunk_test");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let init = Command::new("git").arg("-C").arg(&dir).arg("init").arg("-b").arg("main").output().unwrap();
+        let init = new_git_cmd().arg("-C").arg(&dir).arg("init").arg("-b").arg("main").output().unwrap();
         assert!(init.status.success(), "git init 失败");
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("config").arg("user.email").arg("t@t").output().unwrap();
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("config").arg("user.name").arg("t").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("config").arg("user.email").arg("t@t").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("config").arg("user.name").arg("t").output().unwrap();
         let f = dir.join("a.txt");
         let content: String = (1..=20).map(|i| format!("line{i}\n")).collect();
         fs::write(&f, &content).unwrap();
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("add").arg(".").output().unwrap();
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("commit").arg("-m").arg("init").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("add").arg(".").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("commit").arg("-m").arg("init").output().unwrap();
 
         // 修改两处相隔足够远的内容（line2 与 line18，中间 >6 行未改动）→ 应解析出两个 hunk
         let mut after = String::new();
@@ -2534,10 +2578,10 @@ mod tests {
         let dir = std::env::temp_dir().join("repopilot_hunk_untracked");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let init = Command::new("git").arg("-C").arg(&dir).arg("init").arg("-b").arg("main").output().unwrap();
+        let init = new_git_cmd().arg("-C").arg(&dir).arg("init").arg("-b").arg("main").output().unwrap();
         assert!(init.status.success(), "git init 失败");
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("config").arg("user.email").arg("t@t").output().unwrap();
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("config").arg("user.name").arg("t").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("config").arg("user.email").arg("t@t").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("config").arg("user.name").arg("t").output().unwrap();
         fs::write(dir.join("new.txt"), "hello").unwrap();
         let path = dir.to_string_lossy().to_string();
         let fh = get_hunks(path, "new.txt".to_string()).unwrap();
@@ -2552,13 +2596,13 @@ mod tests {
         let dir = std::env::temp_dir().join("repopilot_dirty_test");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let init = Command::new("git").arg("-C").arg(&dir).arg("init").arg("-b").arg("main").output().unwrap();
+        let init = new_git_cmd().arg("-C").arg(&dir).arg("init").arg("-b").arg("main").output().unwrap();
         assert!(init.status.success(), "git init 失败");
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("config").arg("user.email").arg("t@t").output().unwrap();
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("config").arg("user.name").arg("t").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("config").arg("user.email").arg("t@t").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("config").arg("user.name").arg("t").output().unwrap();
         fs::write(dir.join("a.txt"), "v1").unwrap();
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("add").arg(".").output().unwrap();
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("commit").arg("-m").arg("init").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("add").arg(".").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("commit").arg("-m").arg("init").output().unwrap();
 
         // 干净仓库（仅未跟踪文件不视为脏）
         fs::write(dir.join("untracked.txt"), "x").unwrap();
@@ -2569,11 +2613,11 @@ mod tests {
         assert!(has_local_changes(Path::new(&dir)), "未暂存改动应视为脏");
 
         // 暂存改动 → 脏
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("add").arg(".").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("add").arg(".").output().unwrap();
         assert!(has_local_changes(Path::new(&dir)), "暂存改动应视为脏");
 
         // 提交后干净
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("commit").arg("-m").arg("c2").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("commit").arg("-m").arg("c2").output().unwrap();
         assert!(!has_local_changes(Path::new(&dir)), "提交后应干净");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2584,13 +2628,13 @@ mod tests {
         let dir = std::env::temp_dir().join("repopilot_tag_test");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let init = Command::new("git").arg("-C").arg(&dir).arg("init").arg("-b").arg("main").output().unwrap();
+        let init = new_git_cmd().arg("-C").arg(&dir).arg("init").arg("-b").arg("main").output().unwrap();
         assert!(init.status.success(), "git init 失败");
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("config").arg("user.email").arg("t@t").output().unwrap();
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("config").arg("user.name").arg("t").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("config").arg("user.email").arg("t@t").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("config").arg("user.name").arg("t").output().unwrap();
         fs::write(dir.join("a.txt"), "v1").unwrap();
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("add").arg(".").output().unwrap();
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("commit").arg("-m").arg("init").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("add").arg(".").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("commit").arg("-m").arg("init").output().unwrap();
 
         let path = dir.to_string_lossy().to_string();
         assert!(get_tags(path.clone()).unwrap().is_empty(), "初始应无标签");
@@ -2612,10 +2656,10 @@ mod tests {
         let dir = std::env::temp_dir().join("repopilot_remote_test");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let init = Command::new("git").arg("-C").arg(&dir).arg("init").arg("-b").arg("main").output().unwrap();
+        let init = new_git_cmd().arg("-C").arg(&dir).arg("init").arg("-b").arg("main").output().unwrap();
         assert!(init.status.success(), "git init 失败");
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("config").arg("user.email").arg("t@t").output().unwrap();
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("config").arg("user.name").arg("t").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("config").arg("user.email").arg("t@t").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("config").arg("user.name").arg("t").output().unwrap();
         let path = dir.to_string_lossy().to_string();
 
         assert!(get_remotes(path.clone()).unwrap().is_empty(), "初始应无远程");
@@ -2643,18 +2687,18 @@ mod tests {
         let dir = std::env::temp_dir().join("repopilot_unstage_test");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let init = Command::new("git").arg("-C").arg(&dir).arg("init").arg("-b").arg("main").output().unwrap();
+        let init = new_git_cmd().arg("-C").arg(&dir).arg("init").arg("-b").arg("main").output().unwrap();
         assert!(init.status.success(), "git init 失败");
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("config").arg("user.email").arg("t@t").output().unwrap();
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("config").arg("user.name").arg("t").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("config").arg("user.email").arg("t@t").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("config").arg("user.name").arg("t").output().unwrap();
         fs::write(dir.join("a.txt"), "v1").unwrap();
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("add").arg(".").output().unwrap();
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("commit").arg("-m").arg("init").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("add").arg(".").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("commit").arg("-m").arg("init").output().unwrap();
         let path = dir.to_string_lossy().to_string();
 
         // 已暂存文件 → 取消暂存
         fs::write(dir.join("a.txt"), "v2").unwrap();
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("add").arg("a.txt").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("add").arg("a.txt").output().unwrap();
         let res = unstage_file(path.clone(), "a.txt".to_string()).unwrap();
         assert!(res.ok, "取消暂存应成功");
         let cached = run_git(Path::new(&dir), &["diff", "--cached"]).unwrap_or_default();
@@ -2681,13 +2725,13 @@ mod tests {
         let dir = std::env::temp_dir().join("repopilot_stash_test");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let init = Command::new("git").arg("-C").arg(&dir).arg("init").arg("-b").arg("main").output().unwrap();
+        let init = new_git_cmd().arg("-C").arg(&dir).arg("init").arg("-b").arg("main").output().unwrap();
         assert!(init.status.success(), "git init 失败");
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("config").arg("user.email").arg("t@t").output().unwrap();
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("config").arg("user.name").arg("t").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("config").arg("user.email").arg("t@t").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("config").arg("user.name").arg("t").output().unwrap();
         fs::write(dir.join("a.txt"), "v1").unwrap();
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("add").arg(".").output().unwrap();
-        let _ = Command::new("git").arg("-C").arg(&dir).arg("commit").arg("-m").arg("init").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("add").arg(".").output().unwrap();
+        let _ = new_git_cmd().arg("-C").arg(&dir).arg("commit").arg("-m").arg("init").output().unwrap();
         let path = dir.to_string_lossy().to_string();
 
         // 空列表
